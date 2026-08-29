@@ -1,0 +1,19 @@
+{
+  "active_tasks": 37,
+  "completed_agents": 942,
+  "failed_agents": 12,
+  "total_agents": 991,
+  "reclaimed_tasks": 11,
+  "tasks_reexecuted": 4,
+  "tasks_avoided": 47,
+  "promotion_count": 68,
+  "promotion_rate_pct": 7.2,
+  "duplicate_actions_prevented": 34,
+  "cost_units_junior": 4700,
+  "cost_units_senior": 56400,
+  "cost_units_tiered": 9840,
+  "cost_savings_pct": 82.55,
+  "p50_latency_ms": 1.80,
+  "p95_latency_ms": 4.70,
+  "throughput_tasks_per_sec": 48.0
+}
