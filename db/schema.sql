@@ -79,8 +79,12 @@ CREATE TABLE IF NOT EXISTS task_instances (
     updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     CONSTRAINT task_instances_agent_seq_uk UNIQUE (agent_id, seq),
+    -- 'failed' means: an attempt finished unsuccessfully and is AWAITING
+    -- ORCHESTRATOR ROUTING. The worker reports what happened; the orchestrator
+    -- decides whether that means retry, promote, or dead-letter. Keeping those
+    -- two responsibilities apart is what lets the orchestrator stay stateless.
     CONSTRAINT task_instances_status_ck
-        CHECK (status IN ('pending', 'running', 'succeeded', 'dead')),
+        CHECK (status IN ('pending', 'running', 'succeeded', 'failed', 'dead')),
     CONSTRAINT task_instances_tier_ck
         CHECK (tier IN ('junior', 'senior')),
     CONSTRAINT task_instances_failure_class_ck
@@ -101,6 +105,12 @@ CREATE INDEX IF NOT EXISTS task_instances_lease_idx
 
 CREATE INDEX IF NOT EXISTS task_instances_agent_idx
     ON task_instances (agent_id);
+
+-- Drives the orchestrator's classification sweep: rows a worker has reported on
+-- but nobody has routed yet.
+CREATE INDEX IF NOT EXISTS task_instances_failed_idx
+    ON task_instances (updated_at)
+    WHERE status = 'failed';
 
 
 -- -----------------------------------------------------------------------------
@@ -236,4 +246,29 @@ ON CONFLICT (key) DO NOTHING;
 --     updated_at=now()
 --   WHERE status='running' AND lease_expires < now()
 --   RETURNING id, agent_id, seq;
+-- =============================================================================
+
+
+-- =============================================================================
+-- TASK_INSTANCE STATE MACHINE
+-- =============================================================================
+--   pending   --claim-------------------> running     worker took the lease
+--   running   --success-----------------> succeeded   result committed, cursor++
+--   running   --raises TaskFailure------> failed      awaiting orchestrator
+--   running   --lease expired-----------> pending     reaper, INFRA, same tier
+--   failed    --INFRA or retries left---> pending     same tier, backoff
+--   failed    --CAPABILITY, tier spent--> pending     tier='senior', attempt=0
+--   failed    --POISON or top tier------> dead        written to dlq
+--
+-- The worker only ever moves rows into 'succeeded' or 'failed'. Every routing
+-- decision belongs to the orchestrator. That separation is what keeps the
+-- orchestrator stateless and horizontally scalable.
+--
+-- NOTE ON WHO CREATES TASK ROWS: the API inserts the agent AND every
+-- task_instance of its plan in one transaction, all at tier='junior'. The
+-- claim query's `t.seq = a.cursor` predicate is what gates execution order, so
+-- nothing runs early. This means the worker's checkpoint never INSERTs -- it
+-- only marks succeeded and advances the cursor -- and a promoted task cannot
+-- leak its tier onto its successor, because the successor row already exists
+-- at 'junior'.
 -- =============================================================================
