@@ -1,0 +1,61 @@
+@startuml ReliableAIAgents-Containers
+' ---------------------------------------------------------------------------
+' Reliable AI Agents -- C4 Level 2 (Container diagram)
+'
+' Render:  plantuml docs/architecture.puml
+'          or paste into https://www.plantuml.com/plantuml
+'
+' THE CLAIM THIS DIAGRAM MAKES:
+' no container calls any other container. Every arrow terminates at Postgres.
+' That is what removes the single point of failure and the consensus protocol.
+' ---------------------------------------------------------------------------
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_WITH_LEGEND()
+title Reliable AI Agents — Container Diagram (C4 Level 2)
+
+Person(operator, "Operator / Client", "Submits agent workflows; drives fault injection during a demo")
+
+System_Boundary(sys, "Reliable AI Agents Runtime") {
+
+    Container(api, "Task API", "Python, FastAPI", "POST /agents · GET /agents/{id} · /metrics · /dlq · /chaos/*\nStateless, N replicas. Inserts the agent AND every task row in one transaction.")
+
+    Container(cli, "Control CLI & Dashboard", "Python, argparse", "Seeds workloads, composes pipelines, injects tool failures,\nspawns worker pools, renders live metrics")
+
+    Container(orch, "Orchestrator", "Python, N identical instances", "Every 2s: reap expired leases · classify failures\n(INFRA / CAPABILITY / POISON) · promote tier · reconcile ledger.\nStateless — NO leader election")
+
+    Container(junior, "Junior Worker Pool", "Python, N OS processes", "Claims WHERE tier='junior'. One task per process.\nMain thread: claim→execute→checkpoint. Side thread: lease heartbeat")
+
+    Container(senior, "Senior Worker Pool", "Python, 2 OS processes", "Claims WHERE tier='senior'. Drains escalated tasks only —\n~7% of work, so it scales independently of the junior pool")
+
+    Container(scaler, "Autoscaler", "Python", "Scales orchestrator replicas on reaper backlog,\ncapped by the Postgres connection budget")
+
+    ContainerDb(pg, "PostgreSQL 16", "Relational database", "THE ONLY SHARED STATE\nagents · task_instances · tiers · pipelines\nidempotency · attempts · dlq · runtime_config")
+}
+
+System_Ext(github, "GitHub API", "Public REST endpoints — no credentials required")
+System_Ext(web, "HTTP Endpoints", "Arbitrary URLs fetched by the http tool")
+System_Ext(host, "Host Filesystem & Shell", "Real repo grep; allowlisted commands only")
+
+' --- ingress -----------------------------------------------------------------
+Rel(operator, api, "Submits agents, reads metrics", "HTTPS / JSON")
+Rel(operator, cli, "Runs the demo, injects faults", "shell")
+
+' --- everything talks ONLY to Postgres ---------------------------------------
+Rel(api, pg, "INSERT agent + all task rows (one txn); reads metrics", "SQL")
+Rel(cli, pg, "Seeds agents, writes chaos flags, polls metrics", "SQL")
+Rel_D(orch, pg, "Reaps expired leases; routes failures; promotes tier", "SQL")
+Rel_U(junior, pg, "Claims via FOR UPDATE SKIP LOCKED; renews lease;\ncheckpoints result + advances cursor", "SQL")
+Rel_U(senior, pg, "Claims escalated tasks; checkpoints at senior cost", "SQL")
+Rel(scaler, pg, "Reads active-agent count and reaper backlog", "SQL")
+
+' --- the autoscaler acts on the deployment, not on the orchestrators ---------
+Rel_R(scaler, orch, "Scales replica count", "docker compose / process control")
+
+' --- only workers reach the outside world ------------------------------------
+Rel_D(junior, github, "Live mode only: fetches commits", "HTTPS")
+Rel_D(junior, web, "Live mode only: GET", "HTTPS")
+Rel_D(junior, host, "Live mode only: grep, allowlisted commands", "syscall")
+
+SHOW_LEGEND()
+@enduml
