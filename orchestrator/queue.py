@@ -111,11 +111,19 @@ WHERE a.status = 'running'
 # it would report a backlog that nothing can ever drain.
 DEPTH_SQL = """
 SELECT
-    count(*) FILTER (WHERE t.status = 'pending' AND t.next_run_at <= now()) AS claimable,
-    count(*) FILTER (WHERE t.status = 'pending' AND t.next_run_at >  now()) AS scheduled,
-    count(*) FILTER (WHERE t.status = 'running')                            AS running,
+    count(*) FILTER (
+        WHERE t.status = 'pending' AND t.seq = a.cursor AND t.next_run_at <= now()
+    ) AS claimable,
+    count(*) FILTER (
+        WHERE t.status = 'pending' AND t.seq = a.cursor AND t.next_run_at > now()
+    ) AS scheduled,
+    count(*) FILTER (
+        WHERE t.status = 'pending' AND t.seq <> a.cursor
+    ) AS waiting,
+    count(*) FILTER (WHERE t.status = 'running') AS running,
     coalesce(extract(epoch FROM (now() - min(t.next_run_at) FILTER (
-        WHERE t.status = 'pending' AND t.next_run_at <= now()))), 0)        AS oldest_seconds
+        WHERE t.status = 'pending' AND t.seq = a.cursor
+          AND t.next_run_at <= now()))), 0) AS oldest_seconds
 FROM task_instances t
 JOIN agents a ON a.id = t.agent_id
 WHERE t.status IN ('pending', 'running')
@@ -195,6 +203,7 @@ def depth() -> dict:
     return {
         "claimable": int(row.get("claimable") or 0),
         "scheduled": int(row.get("scheduled") or 0),
+        "waiting": int(row.get("waiting") or 0),
         "running": int(row.get("running") or 0),
         "oldest_claimable_seconds": round(float(row.get("oldest_seconds") or 0.0), 2),
     }

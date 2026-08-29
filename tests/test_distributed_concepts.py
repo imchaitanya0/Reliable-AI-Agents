@@ -754,4 +754,8 @@ class TestFailedAgentLeavesNoOrphans:
         self._poison_first_task([6, 1])
         classify()
         assert [t["status"] for t in get_tasks(healthy)] == ["pending", "pending"]
-        assert queue.depth()["claimable"] == 1
+        # One claimable (seq 0, at the cursor); the other waits on it. That
+        # split is `t.seq = a.cursor` enforcing dependency order.
+        depth = queue.depth()
+        assert depth["claimable"] == 1
+        assert depth["waiting"] == 1
