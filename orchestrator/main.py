@@ -34,6 +34,24 @@ are order-independent.
 Every sweep is idempotent and bounded, which is what allows N instances with no
 leader: `SKIP LOCKED` means two instances never touch the same row, and a sweep
 that is only correct when run once would never be correct here.
+
+COLLABORATORS
+-------------
+Calls, in order, once per tick:
+    reaper.reap()               5.2  expired leases -> back on the queue
+    queue.repair_stalled()      5.1  a running agent always has a row to claim
+    queue.finalise_agents()     5.1  an exhausted plan -> completed
+    classify.classify()         5.5  route failures by class
+    ledger.audit()              5.3  report unsettled action ids
+    ledger.reconcile()          5.3  close the ones whose owner is gone
+
+Calls nothing else. It never touches the database directly -- every query lives
+in the component that owns that table -- and it holds no state beyond a
+shutdown flag, which is what makes killing an instance a non-event.
+
+The components do not know about each other or about this module. They are
+independent sweeps over shared tables; `tick()` is only the thing that decides
+the order and gives each one its own transaction.
 """
 
 from __future__ import annotations
@@ -97,7 +115,12 @@ def tick() -> dict[str, int]:
 
 
 def main() -> int:
-    instance = os.getenv("ORCHESTRATOR_ID", f"orch-{os.getpid()}")
+    # Identity is for logs only -- there is no leader, so nothing coordinates on
+    # it. But it has to be DISTINCT per instance or the demo is unreadable:
+    # every container has PID 1, so a pid-based default labels all N instances
+    # identically and "kill one, nothing changes" cannot be seen. Docker sets
+    # HOSTNAME to the container id, which is unique per replica.
+    instance = os.getenv("ORCHESTRATOR_ID") or f"orch-{os.getenv('HOSTNAME') or os.getpid()}"
     logging.basicConfig(
         level=logging.INFO,
         format=f"%(asctime)s %(levelname)-7s [{instance}] %(message)s",

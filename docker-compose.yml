@@ -1,10 +1,39 @@
+# The whole runtime, in one file.
+#
+#   docker compose up -d                                  everything, 1 of each
+#   docker compose up -d --scale worker-junior=5 \
+#                        --scale orchestrator=3           scaled out
+#   docker kill $(docker compose ps -q worker-junior | head -1)   the demo
+#
+# NOTHING HERE RESTARTS AUTOMATICALLY, and that is deliberate. The demo is
+# `docker kill` on a live worker; a restart policy would quietly bring it back
+# and the audience would be watching Docker recover, not this runtime. Recovery
+# has to come from lease expiry, which is the entire claim.
+
+x-runtime: &runtime
+  build: .
+  environment: &runtime-env
+    DATABASE_URL: postgresql://postgres:postgres@postgres:5432/rai
+    LEASE_TTL_SECONDS: "${LEASE_TTL_SECONDS:-10}"
+    # Admission control. Sized so the system is full exactly when the
+    # autoscaler hits its 10-replica ceiling: 100 / 10 per orchestrator.
+    MAX_ACTIVE_AGENTS: "${MAX_ACTIVE_AGENTS:-100}"
+  depends_on:
+    postgres: {condition: service_healthy}
+
 services:
   postgres:
     image: postgres:16-alpine
     environment:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: rai
-    ports: ["5432:5432"]
+    # Overridable: a machine may already run Postgres on 5432.
+    #   POSTGRES_PORT=55432 docker compose up -d
+    ports: ["${POSTGRES_PORT:-5432}:5432"]
+    # 10 orchestrators x 2 + worker pools + API sits near the default 100.
+    # The replica ceiling and the connection budget must be raised together --
+    # scaling up into an exhausted pool is what turns a spike into an outage.
+    command: postgres -c max_connections=200
     volumes:
       - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
     healthcheck:
@@ -13,24 +42,57 @@ services:
       timeout: 3s
       retries: 20
 
+  # ---------------------------------------------------------------------------
+  # Orchestrator. Reaps expired leases, repairs the queue, routes failures.
+  #
+  # SCALE THIS FREELY -- that is the point. Every instance runs the identical
+  # loop and coordinates only through `FOR UPDATE SKIP LOCKED`, so there is no
+  # leader to elect and no membership to maintain:
+  #
+  #   docker compose up -d --scale orchestrator=3
+  #   docker kill $(docker compose ps -q orchestrator | head -1)   # nothing changes
+  #
+  # Without at least one of these running, NOTHING reclaims an expired lease. A
+  # crashed worker's tasks stay stuck in 'running' forever, failures are never
+  # routed, and the system keeps working but stops healing.
+  # ---------------------------------------------------------------------------
+  # Autoscaled by `python -m scale.autoscaler` (runs on the host, since it
+  # drives the docker CLI): one replica per 10 active agents, capped by the
+  # Postgres connection budget rather than by guesswork.
+  orchestrator:
+    <<: *runtime
+    command: python -m orchestrator.main
+    environment:
+      <<: *runtime-env
+      ORCHESTRATOR_POLL_SECONDS: "${ORCHESTRATOR_POLL_SECONDS:-2.0}"
+      # Sweeps run sequentially, so one connection at a time is all it needs.
+      # This is what makes the orchestrator cheap to scale: connections are a
+      # global budget, and a fat pool per replica is what turns a scale-up into
+      # a database outage.
+      DB_POOL_MAX: "2"
+
   # Junior pool: cheap, fails sometimes. Scale this one freely.
   #   docker compose up -d --scale worker-junior=5
   worker-junior:
-    build: .
+    <<: *runtime
     command: python -m worker.main
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/rai
+      <<: *runtime-env
       POOL_TIER: junior
-    depends_on:
-      postgres: {condition: service_healthy}
 
   # Senior pool: expensive, drains escalations only. ~7% of tasks reach it,
   # which is why it scales independently and stays small.
   worker-senior:
-    build: .
+    <<: *runtime
     command: python -m worker.main
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/rai
+      <<: *runtime-env
       POOL_TIER: senior
-    depends_on:
-      postgres: {condition: service_healthy}
+
+  # Task API: submission, metrics and the chaos controls.
+  #   curl localhost:8000/metrics
+  #   curl -X POST localhost:8000/chaos/config -d '{"escalation_enabled":false}'
+  api:
+    <<: *runtime
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000
+    ports: ["${API_PORT:-8000}:8000"]

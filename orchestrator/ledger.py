@@ -66,6 +66,23 @@ unresolved effect is a real operational fact and a human may need to check Jira.
 The reservation MUST be committed before the action runs. A reservation that
 rolls back together with the action is not a reservation -- it is the
 single-phase design again, with the same hole.
+
+COLLABORATORS
+-------------
+Called by   worker.executor.run_task()   begin() before a side effect,
+                                         settle() after it succeeds
+            orchestrator.main.tick()     audit() then reconcile(), once a sweep
+            api.main / common.metrics    counts() for the dashboard
+Calls       db.pool.pool()
+            common.config.LEASE_TTL_SECONDS   how long before a reservation is
+                                              considered orphaned
+            common.config.ORCHESTRATOR_BATCH
+Reads/writes  idempotency (the only table this module touches)
+
+THIS IS THE ONE ORCHESTRATOR MODULE THE WORKER IMPORTS. It is the seam for 5.3:
+the worker owns when an action happens, this module owns whether it is allowed
+to happen twice. Everything else in `orchestrator/` is invisible to the worker,
+which is what keeps the two lanes independent.
 """
 
 from __future__ import annotations
@@ -74,7 +91,7 @@ import hashlib
 import json
 import logging
 
-from common.config import LEASE_TTL_SECONDS
+from common.config import LEASE_TTL_SECONDS, ORCHESTRATOR_BATCH
 from db.pool import pool
 
 log = logging.getLogger("orchestrator.ledger")
@@ -252,12 +269,26 @@ def counts() -> dict[str, int]:
     }
 
 
+# Batched and SKIP LOCKED for the same reason the reaper is: several
+# orchestrators run this identical sweep. Without it the second one BLOCKS on
+# the first's row locks instead of stepping past them, quietly serialising the
+# instances that are supposed to be independent -- and an unbounded UPDATE holds
+# those locks for the whole backlog.
 RECONCILE_SQL = """
-UPDATE idempotency
+WITH orphaned AS (
+    SELECT key
+    FROM idempotency
+    WHERE state = 'in_flight'
+      AND created_at < now() - make_interval(secs => %(age)s)
+    ORDER BY created_at
+    FOR UPDATE SKIP LOCKED
+    LIMIT %(batch)s
+)
+UPDATE idempotency i
 SET state = 'done', result = %(marker)s, settled_at = now()
-WHERE state = 'in_flight'
-  AND created_at < now() - make_interval(secs => %(age)s)
-RETURNING key, agent_id, seq, action_type
+FROM orphaned o
+WHERE i.key = o.key
+RETURNING i.key, i.agent_id, i.seq, i.action_type
 """
 
 
@@ -302,7 +333,10 @@ def reconcile(after_seconds: float | None = None) -> list[dict]:
         else after_seconds
     )
     with pool().connection() as conn, conn.cursor() as cur:
-        cur.execute(RECONCILE_SQL, {"marker": dumps(UNRESOLVED), "age": age})
+        cur.execute(
+            RECONCILE_SQL,
+            {"marker": dumps(UNRESOLVED), "age": age, "batch": ORCHESTRATOR_BATCH},
+        )
         rows = cur.fetchall()
 
     for r in rows:

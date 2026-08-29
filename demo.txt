@@ -1,0 +1,299 @@
+===============================================================================
+ RELIABLE AI AGENT RUNTIME -- DEMO RUNBOOK
+===============================================================================
+
+ Paste ONE BLOCK AT A TIME. Do not run this file as a script.
+ The pauses between blocks are where you talk; a script that runs everything
+ at once gives you nothing to narrate and no way to slow down when a judge
+ asks a question.
+
+ Two panes:
+   LEFT   the live dashboard  (Block 0.4)
+   RIGHT  everything else
+
+ The whole demo is one sentence: things break, and the system does not care.
+ Every scene is the same shape -- a number before, a deliberate break, the
+ same number after.
+
+ NOTE ON chaos/demo.sh: it hardcodes a path from another machine
+ (/home/karthik/...) and assumes Postgres on 5432. Use this runbook instead.
+
+===============================================================================
+ BLOCK 0 -- SETUP                                        (do this before they arrive)
+===============================================================================
+
+# 0.1  Move into the repo and point every command at the database.
+#      POSTGRES_PORT is 55432 here because this machine already runs its own
+#      PostgreSQL 14 on 5432; the container would fail to bind otherwise.
+cd ~/Hackathon/Reliable-AI-Agents
+export POSTGRES_PORT=55432
+export DATABASE_URL="postgresql://postgres:postgres@localhost:55432/rai"
+export PYTHONPATH=.
+
+# 0.2  Bring up the whole runtime.
+#      LEASE_TTL_SECONDS=10 is a demo setting. The default is 30, which means
+#      a 30-second silence on stage between killing a worker and recovery
+#      becoming visible. Ten seconds is long enough to be real and short
+#      enough to hold a room.
+LEASE_TTL_SECONDS=10 docker compose up -d --build \
+  --scale orchestrator=2 --scale worker-junior=3 --scale worker-senior=1
+
+# 0.3  Confirm all nine containers are up before you start talking.
+#      Expect: postgres, api, 2 orchestrators, 3 junior workers, 1 senior.
+docker compose ps --format '{{.Name}}\t{{.State}}' | sort
+curl -s localhost:8000/health
+
+# 0.4  LEFT PANE. Live dashboard, refreshing every second.
+#      Leave this running for the entire demo -- it is the orchestrator made
+#      visible. The orchestrator is invisible when it works, so without this
+#      the audience has nothing to watch.
+.venv/bin/python -m chaos.harness watch
+
+# 0.5  Clean slate. Run this between scenes too, so each number starts at zero.
+docker compose exec -T postgres psql -U postgres -d rai -q -c \
+  "TRUNCATE agents, task_instances, attempts, idempotency, dlq CASCADE;"
+
+
+===============================================================================
+ BLOCK 1 -- THE MONEY SHOT: KILL A WORKER MID-FLIGHT        (5.1 + 5.2)
+===============================================================================
+ SAY: "A worker is holding leases on tasks it is halfway through. I am going
+       to kill it outright -- not stop it, kill it. It never gets to report
+       anything, because it is dead. The only thing that notices is the lease
+       running out."
+===============================================================================
+
+# 1.1  Submit 20 agents on the demo workload.
+#      seed() mixes easy and hard plans on purpose: that mix is what produces
+#      a realistic escalation rate. Submitting one uniform hard plan would
+#      make the rate an artefact of the fixture rather than a property of the
+#      runtime -- and it would read as ~20%, not the ~7% the pitch quotes.
+.venv/bin/python -m chaos.harness seed 20
+
+# 1.2  Let work get genuinely in flight. Watch the left pane: tasks running.
+sleep 5
+
+# 1.3  Show which tasks are about to be stranded. Say this number out loud --
+#      it is what a naive system would lose.
+docker compose exec -T postgres psql -U postgres -d rai -c \
+  "SELECT lease_owner, count(*) AS holding
+     FROM task_instances WHERE status='running' GROUP BY lease_owner;"
+
+# 1.4  KILL IT. docker kill sends SIGKILL -- no cleanup, no goodbye.
+#      Nothing in compose restarts it; that is deliberate. A restart policy
+#      would have Docker bring the worker back, and the audience would be
+#      watching Docker recover rather than this runtime.
+docker kill $(docker compose ps -q worker-junior | head -1)
+
+# 1.5  WATCH THE LEFT PANE. Within one lease TTL:
+#        leases reclaimed   climbs off zero   <- the reaper noticed
+#        tasks re-executed  climbs            <- another worker picked them up
+#        agents completed   reaches 20        <- nothing was lost
+#      SAY: "Twenty of twenty. One worker died holding live work and no agent
+#            lost its place -- each resumed at its own cursor, not from scratch."
+
+# 1.6  The proof that it resumed rather than restarted.
+#      Every agent's cursor is at the end of its plan and its context carries
+#      a result for every step. A restart-from-scratch would also say
+#      'completed' and would be wrong.
+docker compose exec -T postgres psql -U postgres -d rai -c \
+  "SELECT status, count(*) FROM agents GROUP BY status;"
+
+# 1.7  The evidence row a dead worker could not have written itself.
+docker compose exec -T postgres psql -U postgres -d rai -c \
+  "SELECT worker_id, outcome, count(*) FROM attempts
+    WHERE outcome='reclaimed' GROUP BY worker_id, outcome;"
+
+
+===============================================================================
+ BLOCK 2 -- KILL AN ORCHESTRATOR                          (no leader election)
+===============================================================================
+ SAY: "There is no leader here. No Raft, no ZooKeeper, no election. Every
+       orchestrator runs the identical loop, and one SQL clause --
+       FOR UPDATE SKIP LOCKED -- guarantees two of them never touch the same
+       row. So killing one is not an event."
+===============================================================================
+
+# 2.1  Two orchestrators are running. They have distinct identities in the
+#      logs (each container's hostname), so you can show they are different
+#      processes doing the same job.
+docker compose logs orchestrator | grep "orchestrator up"
+
+# 2.2  Kill one, AND a worker at the same time.
+#      Killing only the orchestrator proves nothing -- nothing was happening.
+#      Killing a worker too means the survivor has real recovery work to do.
+docker kill $(docker compose ps -q orchestrator | head -1)
+docker kill $(docker compose ps -q worker-junior | head -1)
+
+# 2.3  Submit more work and watch it complete anyway.
+.venv/bin/python -m chaos.harness seed 10
+
+# 2.4  SAY: "One orchestrator left, one worker down, and the queue still
+#            drains. There was nothing to fail over, because there was nothing
+#            to lose -- the orchestrator holds no state at all."
+
+
+===============================================================================
+ BLOCK 3 -- THE DUPLICATE THAT DID NOT HAPPEN                     (5.3)
+===============================================================================
+ This is the strongest scene because the failure is counterintuitive.
+ SAY IT SLOWLY:
+       "The worker does not crash INSTEAD of filing the Jira ticket.
+        It crashes AFTER filing it, before it could tell anyone."
+===============================================================================
+
+# 3.1  Take a tool to 100% failure so retries actually happen.
+curl -s -X POST localhost:8000/chaos/tool \
+  -H 'content-type: application/json' \
+  -d '{"name":"jira","failure_rate":1.0}'
+
+# 3.2  Explain the design while it runs. The obvious implementation is to
+#      record the action id AFTER the call succeeds. It does not work:
+#
+#          create ticket  ->  [WORKER DIES HERE]  ->  record action id
+#
+#      The retry checks the id, finds nothing, and files a SECOND ticket.
+#      Worse, it fails silently: "how many action ids exist?" still answers 1
+#      while two tickets sit in Jira. The bug is invisible to the check meant
+#      to catch it.
+#
+#      So the id is RESERVED before the action and SETTLED after it.
+
+# 3.3  The numbers on the left pane:
+#        idempotent actions      completed exactly once
+#        duplicates prevented    actions whose outcome was unknown after a
+#                                crash and which were NOT fired again
+docker compose exec -T postgres psql -U postgres -d rai -c \
+  "SELECT state, count(*) FROM idempotency GROUP BY state;"
+
+# 3.4  Put the tool back before the next scene.
+curl -s -X POST localhost:8000/chaos/tool \
+  -H 'content-type: application/json' -d '{"name":"jira","failure_rate":0.1}'
+
+
+===============================================================================
+ BLOCK 4 -- THE COST TABLE, RUN LIVE                    (the whole argument)
+===============================================================================
+ SAY: "A cost claim is comparative, so it is worthless without its controls.
+       I am going to produce all three baselines on this workload, right now,
+       on this machine -- not from a spreadsheet."
+===============================================================================
+
+# 4.1  BASELINE A -- all-junior. Escalation off: capability failures
+#      dead-letter instead of promoting.
+curl -s -X POST localhost:8000/chaos/config \
+  -H 'content-type: application/json' -d '{"escalation_enabled":false}'
+.venv/bin/python -m chaos.harness seed 20
+# ...wait for it to settle, then:
+.venv/bin/python -m chaos.harness status
+# SAY: "Cheapest -- and look at the dead-letter queue. It does not finish the
+#       work. That second half is the honest part of the comparison."
+
+# 4.2  BASELINE B -- all-senior. Pin every task to the expensive tier.
+docker compose exec -T postgres psql -U postgres -d rai -q -c \
+  "TRUNCATE agents, task_instances, attempts, idempotency, dlq CASCADE;"
+curl -s -X POST localhost:8000/chaos/config \
+  -H 'content-type: application/json' \
+  -d '{"escalation_enabled":true,"force_tier":"senior"}'
+.venv/bin/python -m chaos.harness seed 20
+.venv/bin/python -m chaos.harness status
+# SAY: "Finishes everything. Twelve times the price for every task, including
+#       the ones a cheap model handled perfectly well."
+
+# 4.3  OURS -- tiered. Back to normal.
+docker compose exec -T postgres psql -U postgres -d rai -q -c \
+  "TRUNCATE agents, task_instances, attempts, idempotency, dlq CASCADE;"
+curl -s -X POST localhost:8000/chaos/config \
+  -H 'content-type: application/json' -d '{"force_tier":null}'
+.venv/bin/python -m chaos.harness seed 20
+.venv/bin/python -m chaos.harness status
+# THE LINE: "All-junior is cheapest and leaves work permanently unfinished.
+#            All-senior finishes everything at twelve times the cost.
+#            We finish everything, at roughly two."
+
+
+===============================================================================
+ BLOCK 5 -- BACKPRESSURE AND AUTOSCALING          (if you have time / are asked)
+===============================================================================
+ Only run this if a judge asks "what happens under load?" -- it is a strong
+ answer but it is not the headline.
+===============================================================================
+
+# 5.1  Admission control. The runtime caps concurrent agents at 100 and
+#      refuses the rest with 429 rather than accepting a spike it cannot
+#      serve. Accepting everything means every agent is admitted, none finish
+#      on time, and queue depth climbs with no signal anything is wrong --
+#      failing slowly and invisibly instead of immediately and legibly.
+curl -s localhost:8000/health
+curl -s -X POST localhost:8000/agents -H 'content-type: application/json' \
+  -d '{"plan":[1,10,21,40,41],"count":95}' -o /dev/null -w 'HTTP %{http_code}\n'
+curl -s -X POST localhost:8000/agents -H 'content-type: application/json' \
+  -d '{"plan":[1,10,21,40,41],"count":20}' -w '\nHTTP %{http_code}\n'
+# The second returns 429 with the remaining capacity, not a silent failure.
+
+# 5.2  Autoscaling. One orchestrator per 10 active agents, ceiling of 10.
+#      The ceiling is not arbitrary: Postgres connections are a global budget
+#      shared by every replica, so an uncapped ratio would exhaust
+#      max_connections and start refusing the very connections the
+#      orchestrators need to clear the backlog that triggered the scale-up.
+.venv/bin/python -m scale.autoscaler --once
+docker compose ps -q orchestrator | wc -l    # scaled to match the load
+
+# 5.3  Continuous mode, if you want it running during the demo.
+.venv/bin/python -m scale.autoscaler
+
+
+===============================================================================
+ BLOCK 6 -- THE CLOSING LINE
+===============================================================================
+
+.venv/bin/python -m chaos.harness status
+
+# "We killed a worker mid-task, killed an orchestrator, took a tool to a
+#  hundred percent failure, and forced duplicate execution. Every agent
+#  finished. Zero duplicate side effects. Roughly two times the cost of the
+#  cheap model, against twelve for the expensive one.
+#
+#  The agent did not get smarter. The system around it became reliable."
+
+
+===============================================================================
+ TEARDOWN
+===============================================================================
+
+docker compose down -v     # -v also drops the volume, so the next run is clean
+
+
+===============================================================================
+ IF SOMETHING GOES WRONG
+===============================================================================
+
+# Nothing recovers after a kill
+#   -> No orchestrator is running. That is the one component that reclaims
+#      expired leases; without it the system runs and never heals.
+docker compose ps orchestrator
+docker compose up -d --scale orchestrator=2
+
+# "unknown task ids [...]"
+#   -> The task registry ids changed. List what actually exists:
+.venv/bin/python -m chaos.harness tasks
+.venv/bin/python -m chaos.harness pipelines
+#      Known-good plans:
+#        investigation   1,10,21,40,41
+#        quick-triage    1,2,10,30,41
+#        smoke           1,30
+
+# Port 5432 already in use
+#   -> This machine runs its own PostgreSQL 14. Always export
+#      POSTGRES_PORT=55432 before docker compose (Block 0.1).
+
+# API container exits on boot
+docker compose logs api | tail -20
+
+# Escalation rate looks like 20%, not ~7%
+#   -> You submitted a uniform hard plan through POST /agents. Use
+#      `chaos.harness seed`, which mixes easy and hard plans on purpose.
+
+# Recovery takes 30 seconds and the room goes quiet
+#   -> LEASE_TTL_SECONDS was not set. Bring the stack up with
+#      LEASE_TTL_SECONDS=10 (Block 0.2).

@@ -37,6 +37,18 @@ REAPER_JITTER_SECONDS = float(os.getenv("REAPER_JITTER_SECONDS", "2.0"))
 # Batch bound shared by the queue-repair sweeps, for the same reason.
 ORCHESTRATOR_BATCH = int(os.getenv("ORCHESTRATOR_BATCH", "100"))
 
+# Admission control: the most agents allowed to be running at once.
+#
+# Backpressure is a reliability feature, not a limitation. Without a cap a spike
+# is accepted in full and then fails slowly and invisibly -- every agent
+# admitted, none finishing on time, queue depth climbing, and no signal that
+# anything is wrong. Refusing work at the door turns that into an immediate,
+# legible 429 that a caller can retry.
+#
+# Sized to the autoscaler: 100 agents at one orchestrator per 10 is exactly the
+# 10-replica ceiling, so the system is full and fully scaled at the same moment.
+MAX_ACTIVE_AGENTS = int(os.getenv("MAX_ACTIVE_AGENTS", "100"))
+
 # Tier definitions live in the `tiers` TABLE (see db/schema.sql and
 # common/tiers.py) so that adding a capability tier is one INSERT rather than a
 # code change. Nothing here may duplicate them -- two sources of truth drift.

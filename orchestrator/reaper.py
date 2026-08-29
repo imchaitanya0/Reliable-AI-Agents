@@ -46,6 +46,23 @@ The reclaim and its `attempts` evidence are written in ONE statement. A reaper
 that dies mid-sweep can then never leave a reclaimed-but-unrecorded task -- and
 that evidence row is what makes "% tasks recovered" a count rather than a guess.
 A killed worker never writes its own attempt row, because it died.
+
+COLLABORATORS
+-------------
+Called by   orchestrator.main.tick(), first of the six sweeps -- it is the only
+            one with a deadline attached, so it must never queue behind
+            bookkeeping.
+Calls       db.pool.pool()                    one connection, one transaction
+            common.config.REAPER_BATCH        how many leases per sweep
+            common.config.REAPER_JITTER_SECONDS
+Reads       task_instances  WHERE status='running' AND lease_expires < now()
+Writes      task_instances  -> status='pending'   (returns it to the queue)
+            attempts        -> outcome='reclaimed' (the recovery evidence)
+Never       calls another orchestrator component. Sweeps share no state and no
+            transaction; they meet only in the database.
+
+The worker is the other half of leasing, and the two never import each other:
+the worker renews `lease_expires`, this module notices when it stops.
 """
 
 from __future__ import annotations

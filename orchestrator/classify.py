@@ -36,6 +36,25 @@ kill -9 must never cost senior tokens.
 INFRA retries still use `attempt`, deliberately: that budget exists to stop a
 permanently dead tool consuming worker slots forever, and for that purpose the
 total number of handouts is exactly the right measure.
+
+COLLABORATORS
+-------------
+Called by   orchestrator.main.tick(), after the queue-repair sweeps so a row
+            they just enqueued is visible in the same pass.
+Calls       db.pool.pool()
+            common.failures.backoff_seconds()   the retry gate
+            common.tiers.next_tier()            where a promotion goes
+            common.runtime.retries_enabled()    \
+            common.runtime.escalation_enabled()  > the live chaos controls
+            common.runtime.force_tier()         /
+Reads       task_instances WHERE status='failed'; attempts (for the budgets)
+Writes      task_instances -> pending | tier=<next> | dead
+            agents         -> status='failed'
+            dlq            -> the terminal record, with its attempt trail
+
+The worker RAISES a failure class; this module ROUTES it. They agree on three
+strings in common.failures and share nothing else -- the worker never learns
+whether its failure caused a retry, a promotion or a dead-letter.
 """
 
 from __future__ import annotations

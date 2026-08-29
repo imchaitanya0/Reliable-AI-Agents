@@ -15,18 +15,20 @@ the API, the demo CLI and the dashboard can never disagree about what happened.
 
 from __future__ import annotations
 
+from json import dumps
 from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from chaos.harness import set_tool
+from common.config import MAX_ACTIVE_AGENTS
 from common.metrics import snapshot
 from common.runtime import force_tier
 from common.tiers import all_tiers, base_tier
 from db.pool import close_pool, fetchall, fetchone, pool
 from tasks.registry import DEMO_PLAN, TASK_DEFS
+from tasks.tools import TOOLS
 
 app = FastAPI(
     title="Reliable AI Agent Runtime",
@@ -53,12 +55,9 @@ class ToolChaos(BaseModel):
     """`POST /chaos/tool` body."""
 
     name: str
-    failure_rate: float = Field(ge=0.0, le=1.0)
-
-    #: Accepted for contract compatibility and currently ignored: `set_tool`
-    #: writes only `failure_rate` into `tool_overrides`. Injecting latency would
-    #: mean changing chaos/harness.py, which belongs to another lane.
-    latency_ms: int | None = None
+    failure_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+    latency_ms: int | None = Field(default=None, ge=0)
+    mode: Literal["mock", "live"] | None = None
 
 
 class ConfigChaos(BaseModel):
@@ -93,9 +92,16 @@ def _shutdown() -> None:
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    """Liveness plus a real database round trip."""
+    """Liveness, a real database round trip, and remaining admission capacity."""
     row = fetchone("SELECT 1 AS ok")
-    return {"status": "ok" if row else "degraded"}
+    active = fetchone("SELECT count(*) AS n FROM agents WHERE status='running'")
+    running = int((active or {}).get("n", 0))
+    return {
+        "status": "ok" if row else "degraded",
+        "active_agents": running,
+        "max_active_agents": MAX_ACTIVE_AGENTS,
+        "capacity_remaining": max(0, MAX_ACTIVE_AGENTS - running),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +147,35 @@ def submit_agents(body: SubmitAgents) -> dict[str, list[str]]:
     agent_ids: list[str] = []
 
     with pool().connection() as conn, conn.cursor() as cur:
+        # Admission control, INSIDE the same transaction as the insert.
+        #
+        # Checked here rather than up front because a check that commits before
+        # the insert is not a limit: two submissions racing both read 90 active,
+        # both decide there is room for 20, and the system ends up at 130. The
+        # lock makes concurrent submitters queue behind one another so the count
+        # they read is the count they are adding to.
+        #
+        # Refusing work at the door is the reliable behaviour. Accepting a spike
+        # in full means every agent is admitted, none finish on time, and queue
+        # depth climbs with no signal that anything is wrong -- failing slowly
+        # and invisibly instead of immediately and legibly.
+        cur.execute("SELECT pg_advisory_xact_lock(hashtext('admission'))")
+        cur.execute("SELECT count(*) AS n FROM agents WHERE status = 'running'")
+        active = cur.fetchone()["n"]
+
+        if active + body.count > MAX_ACTIVE_AGENTS:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error": "at capacity",
+                    "active_agents": active,
+                    "requested": body.count,
+                    "max_active_agents": MAX_ACTIVE_AGENTS,
+                    "capacity_remaining": max(0, MAX_ACTIVE_AGENTS - active),
+                    "retry": "resubmit when agents complete, or raise MAX_ACTIVE_AGENTS",
+                },
+            )
+
         for _ in range(body.count):
             cur.execute(
                 "INSERT INTO agents (plan, status) VALUES (%s, 'running') RETURNING id",
@@ -225,15 +260,44 @@ def dead_letter_queue(limit: int = 100) -> list[dict[str, Any]]:
 # the all-senior number is produced by the same system on the same stage.
 
 
+# Written straight into `runtime_config.tool_overrides`, the same key
+# `tasks.tools` reads on every call. jsonb_set with create=true merges one
+# tool's entry without disturbing the others, so injecting a fault into `jira`
+# cannot silently clear an override already set on `github`.
+SET_TOOL_OVERRIDE_SQL = """
+UPDATE runtime_config
+SET value = jsonb_set(value, %(path)s, coalesce(value #> %(path)s, '{}'::jsonb)
+                                       || %(patch)s::jsonb, true)
+WHERE key = 'tool_overrides'
+"""
+
+
 @app.post("/chaos/tool")
 def chaos_tool(body: ToolChaos) -> dict[str, Any]:
-    """Set a mock tool's injected failure rate."""
-    set_tool(body.name, body.failure_rate)
-    return {
-        "tool": body.name,
-        "failure_rate": body.failure_rate,
-        "latency_ms_ignored": body.latency_ms is not None,
-    }
+    """
+    Inject a fault into one tool: failure rate, added latency, or mock/live.
+
+    Only the fields actually sent are written, so raising `jira`'s failure rate
+    does not quietly reset a latency override already in place.
+    """
+    if body.name not in TOOLS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"unknown tool {body.name!r}; known tools are {sorted(TOOLS)}",
+        )
+
+    patch = body.model_dump(exclude_unset=True, exclude_none=True)
+    patch.pop("name", None)
+    if not patch:
+        raise HTTPException(status_code=422, detail="no tool settings supplied")
+
+    with pool().connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            SET_TOOL_OVERRIDE_SQL,
+            {"path": [body.name], "patch": dumps(patch)},
+        )
+
+    return {"tool": body.name, "applied": patch}
 
 
 @app.post("/chaos/config")
@@ -256,8 +320,6 @@ def chaos_config(body: ConfigChaos) -> dict[str, Any]:
                 status_code=422,
                 detail=f"unknown tier {sent['force_tier']!r}; known tiers are {sorted(valid)}",
             )
-
-    from json import dumps
 
     with pool().connection() as conn, conn.cursor() as cur:
         for key, value in sent.items():

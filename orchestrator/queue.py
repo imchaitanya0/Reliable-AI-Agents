@@ -32,6 +32,23 @@ That trade is worth making for a guarantee the whole pitch rests on.
 
 Both sweeps are idempotent and bounded, so any number of orchestrators may run
 them concurrently.
+
+COLLABORATORS
+-------------
+Called by   orchestrator.main.tick() -- repair_stalled() then finalise_agents()
+            api.main (indirectly, via the metrics snapshot reading depth())
+Calls       db.pool.pool()                    one connection per function
+            common.tiers.base_tier()          repaired rows always start cheap
+            common.config.ORCHESTRATOR_BATCH  bounded like every sweep
+Reads       agents, task_instances
+Writes      task_instances  -> INSERT the missing row at the cursor
+            agents          -> status='completed' when the plan is exhausted
+Never       executes a task, and never decides a retry. It only ensures the row
+            a worker needs to find actually exists.
+
+repair_stalled() is deliberately the mirror of the claim query: it creates rows
+that satisfy `t.seq = a.cursor AND a.status='running'`, which is exactly what
+the worker looks for.
 """
 
 from __future__ import annotations
