@@ -16,12 +16,56 @@ from worker.main import process_one
 
 
 def _fail(agent_id: str, fc: str, attempt: int = 1, tier: str = "junior") -> None:
+    """
+    Put seq 0 into 'failed' as a worker would, WITH its evidence.
+
+    The attempts rows are not decoration. Promotion counts CAPABILITY failures
+    from `attempts`, never from `task_instances.attempt`, precisely so that a
+    reaper reclaim -- recorded as outcome='reclaimed' -- cannot fund an
+    escalation. A helper that moved the counter without writing the evidence
+    would be testing a state the runtime can never actually reach.
+    """
     with pool().connection() as conn, conn.cursor() as cur:
         cur.execute(
             """UPDATE task_instances SET status='failed', failure_class=%s,
-               attempt=%s, tier=%s WHERE agent_id=%s AND seq=0""",
+               attempt=%s, tier=%s WHERE agent_id=%s AND seq=0
+               RETURNING id""",
             (fc, attempt, tier, agent_id),
         )
+        task_id = cur.fetchone()["id"]
+        for n in range(1, attempt + 1):
+            cur.execute(
+                """INSERT INTO attempts (task_instance_id, agent_id, seq,
+                       attempt_no, tier, worker_id, outcome, failure_class, ended_at)
+                   VALUES (%s, %s, 0, %s, %s, 'test-worker', 'failed', %s, now())""",
+                (task_id, agent_id, n, tier, fc),
+            )
+
+
+def _reclaim(agent_id: str, times: int = 1, tier: str = "junior") -> None:
+    """
+    Simulate `times` worker deaths on seq 0, exactly as the reaper records them.
+
+    Bumps `attempt` (the claim query does that on every handout) and writes
+    outcome='reclaimed' evidence. Nothing was learned about the task itself --
+    only about the machines that kept dying under it.
+    """
+    with pool().connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM task_instances WHERE agent_id=%s AND seq=0", (agent_id,)
+        )
+        task_id = cur.fetchone()["id"]
+        for n in range(1, times + 1):
+            cur.execute(
+                "UPDATE task_instances SET attempt = attempt + 1 WHERE id=%s",
+                (task_id,),
+            )
+            cur.execute(
+                """INSERT INTO attempts (task_instance_id, agent_id, seq,
+                       attempt_no, tier, worker_id, outcome, failure_class, ended_at)
+                   VALUES (%s, %s, 0, %s, %s, 'dead-worker', 'reclaimed', 'INFRA', now())""",
+                (task_id, agent_id, n, tier),
+            )
 
 
 def _skip_backoff(agent_id: str) -> None:

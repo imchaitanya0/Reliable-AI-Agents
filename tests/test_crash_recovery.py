@@ -102,6 +102,11 @@ def test_sigkill_mid_flight_loses_nothing():
                     break
             time.sleep(0.5)
     finally:
+        # A worker that outlives this test claims tasks belonging to the NEXT
+        # one, which surfaces as unrelated tests failing intermittently -- the
+        # worst kind of flake, because the failure never points at its cause.
+        # SIGTERM is only a request (the worker finishes the task in hand), so
+        # every escalation has to actually be waited on.
         for w in workers:
             if w.poll() is None:
                 w.send_signal(signal.SIGTERM)
@@ -110,6 +115,7 @@ def test_sigkill_mid_flight_loses_nothing():
                 w.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 w.kill()
+                w.wait(timeout=5)
 
     # --- every agent finished -------------------------------------------------
     agents = [get_agent(a) for a in agent_ids]

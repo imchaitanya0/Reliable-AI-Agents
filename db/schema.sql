@@ -162,18 +162,57 @@ CREATE INDEX IF NOT EXISTS task_instances_failed_idx
 -- replacement will SOMETIMES run the same task concurrently.
 --
 -- This table is the defence. Before any externally visible action, the task
--- writes sha256(agent_id:seq:action) here with ON CONFLICT DO NOTHING. If the
--- insert affected zero rows, the action already happened; return the stored
--- result instead of doing it twice.
+-- reserves sha256(agent_id:seq:action) here. A retry that finds the key knows
+-- the action already happened and returns the stored result instead of doing it
+-- twice.
+--
+-- THE LEDGER IS TWO-PHASE, AND IT HAS TO BE
+-- -----------------------------------------
+-- Read the failure this table exists for closely:
+--
+--     create Jira ticket -> SUCCESS -> worker dies before acknowledging
+--       -> retry -> check action id -> already executed -> do not duplicate
+--
+-- The crash is AFTER the action succeeds. So a ledger row written after the
+-- fact cannot help: the window between "ticket created" and "row committed" is
+-- exactly where the worker dies, the retry finds no key, and a second ticket is
+-- created. Worse, it fails silently -- `SELECT count(*) FROM idempotency` still
+-- answers 1 while two tickets exist, so the obvious check passes.
+--
+-- A single-phase ledger cannot close that window, because the result does not
+-- exist until the action has already had its effect. Hence two phases:
+--
+--   state='in_flight'  reserved BEFORE the action. It may or may not have run.
+--   state='done'       settled AFTER it succeeded; `result` is authoritative.
+--
+-- A retry that finds 'in_flight' must NOT act: either a twin is mid-action, or
+-- a worker died in the window. Both mean the effect may already exist. That
+-- ambiguity is real, and orchestrator/ledger.py reports it rather than guessing.
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS idempotency (
     key         TEXT        PRIMARY KEY,     -- sha256(agent_id:seq:action_type)
     agent_id    UUID        NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
     seq         INT         NOT NULL,
     action_type TEXT        NOT NULL,
-    result      JSONB       NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+
+    state       TEXT        NOT NULL DEFAULT 'in_flight',
+    result      JSONB,                       -- NULL until settled
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    settled_at  TIMESTAMPTZ,
+
+    CONSTRAINT idempotency_state_ck
+        CHECK (state IN ('in_flight', 'done')),
+    -- A settled row with no result would let a replay hand back NULL as if it
+    -- were the answer the action produced.
+    CONSTRAINT idempotency_settled_has_result_ck
+        CHECK (state <> 'done' OR result IS NOT NULL)
 );
+
+-- Drives the audit sweep: reservations that outlived the lease that would have
+-- let their owner settle them.
+CREATE INDEX IF NOT EXISTS idempotency_in_flight_idx
+    ON idempotency (created_at)
+    WHERE state = 'in_flight';
 
 
 -- -----------------------------------------------------------------------------

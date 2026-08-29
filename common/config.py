@@ -24,6 +24,19 @@ WORKER_ID = os.getenv("WORKER_ID", f"worker-{os.getpid()}")
 WORKER_POLL_SECONDS = float(os.getenv("WORKER_POLL_SECONDS", "0.5"))
 ORCHESTRATOR_POLL_SECONDS = float(os.getenv("ORCHESTRATOR_POLL_SECONDS", "2.0"))
 
+# How many expired leases one reaper sweep may reclaim. Bounds the blast radius
+# of a mass eviction: the sweep is short, holds few locks, and simply runs again
+# on the next tick rather than locking every affected row at once.
+REAPER_BATCH = int(os.getenv("REAPER_BATCH", "100"))
+
+# Reclaimed tasks are spread over [0, jitter) seconds. Requeueing a thousand
+# tasks at exactly now() does not remove the stampede, it just moves it from the
+# reaper to the claim query.
+REAPER_JITTER_SECONDS = float(os.getenv("REAPER_JITTER_SECONDS", "2.0"))
+
+# Batch bound shared by the queue-repair sweeps, for the same reason.
+ORCHESTRATOR_BATCH = int(os.getenv("ORCHESTRATOR_BATCH", "100"))
+
 # Tier definitions live in the `tiers` TABLE (see db/schema.sql and
 # common/tiers.py) so that adding a capability tier is one INSERT rather than a
 # code change. Nothing here may duplicate them -- two sources of truth drift.

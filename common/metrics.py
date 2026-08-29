@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from common.config import LEASE_TTL_SECONDS
 from common.tiers import all_tiers, base_tier, top_tier
 from db.pool import pool
 
@@ -31,9 +32,36 @@ SQL = {
         SELECT count(*) AS n FROM attempts WHERE outcome = 'reclaimed'
     """,
     "cost": "SELECT coalesce(sum(cost_units),0) AS c FROM agents",
-    "dupes": "SELECT count(*) AS n FROM idempotency",
+    # Split by state: a settled id is an action that completed exactly once; an
+    # unsettled one older than a lease is an action whose outcome is unknown --
+    # i.e. a duplicate the ledger prevented. Counting them together would hide
+    # the number that actually demonstrates 5.3.
+    "dupes": """
+        SELECT count(*) FILTER (WHERE state = 'done') AS settled,
+               count(*) FILTER (
+                   WHERE state = 'in_flight'
+                     AND created_at < now() - make_interval(secs => %(ttl)s)
+               ) AS prevented
+        FROM idempotency
+    """,
     "dlq": "SELECT count(*) AS n FROM dlq",
     "totals": "SELECT count(*) AS n FROM task_instances",
+    # 5.1: agents whose cursor points at a task that does not exist. Must be 0 --
+    # a non-zero reading is work that can never be picked up by anything.
+    "stalled": """
+        SELECT count(*) AS n FROM agents a
+        WHERE a.status = 'running'
+          AND a.cursor < coalesce(array_length(a.plan, 1), 0)
+          AND NOT EXISTS (
+              SELECT 1 FROM task_instances t
+              WHERE t.agent_id = a.id AND t.seq = a.cursor
+          )
+    """,
+    # 5.2: expired leases the reaper has not yet reclaimed -- its backlog.
+    "orphaned": """
+        SELECT count(*) AS n FROM task_instances
+        WHERE status = 'running' AND lease_expires < now()
+    """,
     "latency": """
         SELECT
           coalesce(percentile_disc(0.5) WITHIN GROUP (
@@ -58,9 +86,11 @@ def snapshot() -> dict[str, Any]:
         promoted = _rows(cur, "promotions", {"base": base_tier()})[0]["n"]
         reclaimed = _rows(cur, "reclaimed")[0]["n"]
         spent = _rows(cur, "cost")[0]["c"]
-        dupes = _rows(cur, "dupes")[0]["n"]
+        ledger_row = _rows(cur, "dupes", {"ttl": LEASE_TTL_SECONDS})[0]
         dead = _rows(cur, "dlq")[0]["n"]
         total_tasks = _rows(cur, "totals")[0]["n"]
+        stalled = _rows(cur, "stalled")[0]["n"]
+        orphaned = _rows(cur, "orphaned")[0]["n"]
         lat = _rows(cur, "latency")[0]
 
     ladder = all_tiers()
@@ -96,6 +126,11 @@ def snapshot() -> dict[str, Any]:
         "recovery": {
             "leases_reclaimed": reclaimed,
             "tasks_reexecuted": reclaimed,
+            # Both must read 0 in a healthy runtime. `stalled_agents` is the
+            # 5.1 invariant -- work that exists but nothing can ever claim --
+            # and `orphaned_leases` is the reaper's outstanding backlog.
+            "stalled_agents": stalled,
+            "orphaned_leases": orphaned,
         },
         "escalation": {
             "promoted": promoted,
@@ -115,7 +150,12 @@ def snapshot() -> dict[str, Any]:
             "all_senior_baseline": all_dear,
             "vs_all_senior": round(spent / all_dear, 3) if all_dear else 0.0,
         },
-        "idempotency": {"actions_guarded": dupes},
+        "idempotency": {
+            "actions_guarded": ledger_row["settled"],
+            # Actions whose outcome was unknown after a crash and which were
+            # therefore NOT performed a second time.
+            "duplicates_prevented": ledger_row["prevented"],
+        },
         "dlq": {"size": dead},
         "latency": {"p50_s": round(float(lat["p50"]), 3),
                     "p99_s": round(float(lat["p99"]), 3)},

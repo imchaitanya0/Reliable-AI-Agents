@@ -15,6 +15,27 @@ So failures are classified before they are retried:
 Escalating on INFRA would mean a kill -9 promotes work to the expensive model
 for zero benefit. Escalating on POISON burns senior compute on something no
 model can fix. This routing is what makes the cost claim defensible.
+
+WHICH COUNTER PROMOTION READS -- AND WHY IT IS NOT `attempt`
+------------------------------------------------------------
+`task_instances.attempt` is incremented by the CLAIM query, so it counts every
+time the task was handed to a worker -- INCLUDING the handouts the reaper caused
+after a worker died. Driving promotion from it means a task evicted twice by
+infrastructure is promoted on its FIRST genuine capability failure, having never
+had its second fair attempt.
+
+That is not a corner case here. It is the common path in the very demo this
+system is built around: kill a worker, and every task it held moves a step
+closer to the expensive tier. Escalation rate and cost both drift upward, the
+cost thesis quietly weakens, and every test still passes.
+
+So promotion counts CAPABILITY failures, and only those, from the `attempts`
+evidence table -- where a reclaim is recorded as 'reclaimed', not 'failed'. A
+kill -9 must never cost senior tokens.
+
+INFRA retries still use `attempt`, deliberately: that budget exists to stop a
+permanently dead tool consuming worker slots forever, and for that purpose the
+total number of handouts is exactly the right measure.
 """
 
 from __future__ import annotations
@@ -76,6 +97,28 @@ SELECT attempt_no, tier, outcome, failure_class, worker_id, started_at, ended_at
 FROM attempts WHERE task_instance_id = %(id)s ORDER BY id
 """
 
+# Capability failures AT THE CURRENT TIER. Reclaims are excluded by
+# construction: the reaper records them as outcome='reclaimed', so a worker
+# eviction can never consume this budget.
+CAPABILITY_ATTEMPTS_SQL = """
+SELECT count(*) AS n FROM attempts
+WHERE task_instance_id = %(id)s
+  AND tier            = %(tier)s
+  AND outcome         = 'failed'
+  AND failure_class   = 'CAPABILITY'
+"""
+
+
+def capability_attempts(cur, task: dict) -> int:
+    """
+    How many times this task has failed ON ITS OWN MERITS at its current tier.
+
+    THIS is the number promotion is allowed to read -- never
+    `task_instances.attempt`. See the module docstring.
+    """
+    cur.execute(CAPABILITY_ATTEMPTS_SQL, {"id": task["id"], "tier": task["tier"]})
+    return cur.fetchone()["n"]
+
 
 def _kill(cur, task: dict, reason: str) -> None:
     """Terminal. Record the whole trail -- the DLQ is for humans to read."""
@@ -122,7 +165,8 @@ def route_one(cur, task: dict) -> str:
         return "retry"
 
     # CAPABILITY -- the only path that ever spends more money.
-    if task["attempt"] < task["max_attempts_per_tier"]:
+    # Counted from evidence, so infra reclaims cannot fund an escalation.
+    if capability_attempts(cur, task) < task["max_attempts_per_tier"]:
         cur.execute(
             RETRY_SQL,
             {"id": task["id"], "backoff": backoff_seconds(task["attempt"])},

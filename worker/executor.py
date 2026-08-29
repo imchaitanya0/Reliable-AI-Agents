@@ -8,15 +8,13 @@ idempotency key.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 from typing import Any
 
-from common.failures import PoisonFailure, TaskFailure
+from common.failures import InfraFailure, PoisonFailure, TaskFailure
+from orchestrator import ledger
 from common.tiers import cost_of
 from common.protocol import TaskContext, TaskDef
-from db.pool import pool
 
 log = logging.getLogger(__name__)
 
@@ -42,16 +40,11 @@ def idem_key(agent_id: str, seq: int, action_type: str) -> str:
     Deterministic key for an externally visible action.
 
     Both the original attempt and any recovery attempt compute the SAME digest,
-    which is what turns at-least-once delivery into exactly-once effect.
+    which is what turns at-least-once delivery into exactly-once effect. The
+    digest itself lives in orchestrator.ledger so there is exactly one
+    definition of it.
     """
-    return hashlib.sha256(f"{agent_id}:{seq}:{action_type}".encode()).hexdigest()
-
-
-RESERVE_SQL = """
-INSERT INTO idempotency (key, agent_id, seq, action_type, result)
-VALUES (%(key)s, %(agent_id)s, %(seq)s, %(action_type)s, %(result)s)
-ON CONFLICT (key) DO NOTHING
-"""
+    return ledger.action_id(agent_id, seq, action_type)
 
 
 def run_task(
@@ -92,39 +85,32 @@ def run_task(
     )
 
     # ---- idempotency guard for externally visible actions --------------------
-    # Reclaim-on-timeout guarantees a slow-but-alive worker and its replacement
-    # will sometimes run the same task concurrently. Whoever wins the INSERT
-    # owns the action; the loser returns the stored result instead of doing it
-    # twice.
-    #
-    # Known window: a crash after reserving but before the action completes
-    # loses that action. Closing it properly needs a transactional outbox, which
-    # is out of scope. The metric we claim -- duplicate actions prevented -- is
-    # correct under this design.
+    # Lease recovery guarantees a slow-but-alive worker and its replacement will
+    # sometimes run the same task concurrently. The ledger is what makes that
+    # harmless. It is two-phase because the failure it defends against is a
+    # crash AFTER the action succeeded -- see orchestrator/ledger.py.
+    action_key: str | None = None
     if task_def.side_effecting:
-        key = idem_key(agent_id, seq, f"task:{task_def_id}")
-        with pool().connection() as conn, conn.cursor() as cur:
-            cur.execute(
-                RESERVE_SQL,
-                {
-                    "key": key,
-                    "agent_id": agent_id,
-                    "seq": seq,
-                    "action_type": f"task:{task_def_id}",
-                    "result": json.dumps({"status": "reserved"}),
-                },
-            )
-            reserved = cur.rowcount == 1
+        status, stored, action_key = ledger.begin(
+            agent_id, seq, f"task:{task_def_id}"
+        )
 
-        if not reserved:
-            with pool().connection() as conn, conn.cursor() as cur:
-                cur.execute(
-                    "SELECT result FROM idempotency WHERE key = %s", (key,)
-                )
-                row = cur.fetchone()
-            stored = (row or {}).get("result") or {}
+        if status == ledger.DONE:
+            # Already executed. Return what it produced; do NOT run it again.
             log.info("duplicate suppressed agent=%s seq=%s", agent_id, seq)
-            return stored, 0, 0, True
+            return stored or {}, 0, 0, True
+
+        if status == ledger.IN_FLIGHT:
+            # A twin reserved this action and never settled it. The effect may
+            # already exist, so acting now risks the exact duplicate the ledger
+            # exists to prevent -- and inventing a result would be worse. Report
+            # it as INFRA so the task is retried once the ambiguity resolves:
+            # by then the twin has either settled the id (-> DONE, real result
+            # returned) or is provably gone.
+            raise InfraFailure(
+                f"action task:{task_def_id} is in flight for agent={agent_id} "
+                f"seq={seq}; outcome unknown, refusing to duplicate"
+            )
 
     # ---- run it -------------------------------------------------------------
     try:
@@ -141,13 +127,10 @@ def run_task(
             f"task {task_def_id} returned {type(result).__name__}, expected dict"
         )
 
-    if task_def.side_effecting:
-        key = idem_key(agent_id, seq, f"task:{task_def_id}")
-        with pool().connection() as conn, conn.cursor() as cur:
-            cur.execute(
-                "UPDATE idempotency SET result = %s WHERE key = %s",
-                (json.dumps(result), key),
-            )
+    if action_key is not None:
+        # Phase two: the action succeeded, so record what it produced. Any later
+        # retry now sees DONE and replays this instead of acting again.
+        ledger.settle(action_key, result)
 
     cost, tokens = cost_of(tier)
     return result, cost, tokens, False
