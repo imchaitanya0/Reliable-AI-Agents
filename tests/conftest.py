@@ -9,6 +9,7 @@ whatever registry Lane A ships plugs straight in.
 from __future__ import annotations
 
 import os
+import subprocess
 import time
 
 os.environ.setdefault(
@@ -73,8 +74,30 @@ REGISTRY: dict[int, TaskDef] = {
 }
 
 
+# The worker subprocess entrypoint, matched against a process command line.
+# Specific enough that it cannot match pytest itself.
+_WORKER_PROC = "tests/_worker_proc.py"
+
+
+def _kill_stray_workers() -> None:
+    """
+    Ensure no worker subprocess outlives the test that spawned it.
+
+    A survivor claims tasks belonging to the next test, which shows up as
+    unrelated tests failing intermittently. Cheap insurance, and this suite is
+    the only thing that runs these processes.
+    """
+    subprocess.run(
+        ["pkill", "-9", "-f", _WORKER_PROC],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+
 @pytest.fixture(autouse=True)
 def clean_db():
+    _kill_stray_workers()
     _CALLS.clear()
     with pool().connection() as conn, conn.cursor() as cur:
         cur.execute("TRUNCATE agents, task_instances, idempotency, attempts, dlq CASCADE")
