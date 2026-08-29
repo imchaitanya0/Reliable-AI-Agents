@@ -12,6 +12,7 @@
 -- =============================================================================
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;   -- gen_random_uuid()
+CREATE EXTENSION IF NOT EXISTS vector;     -- semantic dedup + loop guardrails
 
 
 -- -----------------------------------------------------------------------------
@@ -34,6 +35,8 @@ CREATE TABLE IF NOT EXISTS agents (
     context      JSONB       NOT NULL DEFAULT '{}'::jsonb,  -- {seq: result} accumulated
     cost_units   INT         NOT NULL DEFAULT 0,
     tokens_used  INT         NOT NULL DEFAULT 0,
+    query_text   TEXT,
+    query_embedding vector(16),
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
 
@@ -80,7 +83,7 @@ CREATE TABLE IF NOT EXISTS task_instances (
 
     CONSTRAINT task_instances_agent_seq_uk UNIQUE (agent_id, seq),
     CONSTRAINT task_instances_status_ck
-        CHECK (status IN ('pending', 'running', 'succeeded', 'dead')),
+        CHECK (status IN ('pending', 'running', 'succeeded', 'failed', 'dead')),
     CONSTRAINT task_instances_tier_ck
         CHECK (tier IN ('junior', 'senior')),
     CONSTRAINT task_instances_failure_class_ck
@@ -121,8 +124,14 @@ CREATE TABLE IF NOT EXISTS idempotency (
     agent_id    UUID        NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
     seq         INT         NOT NULL,
     action_type TEXT        NOT NULL,
-    result      JSONB       NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    state       TEXT        NOT NULL DEFAULT 'in_flight',
+    result      JSONB,
+    error       TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    CONSTRAINT idempotency_state_ck
+        CHECK (state IN ('in_flight', 'done', 'failed'))
 );
 
 
@@ -141,7 +150,7 @@ CREATE TABLE IF NOT EXISTS attempts (
     attempt_no       INT         NOT NULL,
     tier             TEXT        NOT NULL,
     worker_id        TEXT,
-    outcome          TEXT        NOT NULL,   -- 'succeeded' | 'failed' | 'reclaimed'
+    outcome          TEXT        NOT NULL,   -- 'started' | 'succeeded' | 'failed' | 'reclaimed'
     failure_class    TEXT,
     cost_units       INT         NOT NULL DEFAULT 0,
     tokens           INT         NOT NULL DEFAULT 0,
@@ -152,6 +161,22 @@ CREATE TABLE IF NOT EXISTS attempts (
 CREATE INDEX IF NOT EXISTS attempts_agent_idx    ON attempts (agent_id);
 CREATE INDEX IF NOT EXISTS attempts_outcome_idx  ON attempts (outcome);
 CREATE INDEX IF NOT EXISTS attempts_tier_idx     ON attempts (tier);
+
+
+-- -----------------------------------------------------------------------------
+-- metrics_counters — explicit counters for events that are not durable rows
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS metrics_counters (
+    key   TEXT PRIMARY KEY,
+    value BIGINT NOT NULL DEFAULT 0
+);
+
+INSERT INTO metrics_counters (key, value) VALUES
+    ('zombie_writes_blocked', 0),
+    ('duplicate_actions_blocked', 0),
+    ('semantic_deduplications', 0),
+    ('semantic_loop_blocks', 0)
+ON CONFLICT (key) DO NOTHING;
 
 
 -- -----------------------------------------------------------------------------

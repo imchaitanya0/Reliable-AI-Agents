@@ -42,6 +42,7 @@ class TaskContext:
     seq: int
     tier: Tier
     prior: dict[int, dict[str, Any]] = field(default_factory=dict)
+    tool_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     # Injected by the executor. Wraps sha256(agent_id:seq:action_type) so a task
     # never has to know how keys are derived.

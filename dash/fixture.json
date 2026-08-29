@@ -1,0 +1,13 @@
+{
+  "agents": {"running": 16, "completed": 4},
+  "tasks": {"pending": 40, "running": 3, "succeeded": 57, "dead": 0},
+  "escalation_rate": 0.07,
+  "senior_tasks_completed": 4,
+  "total_tasks_completed": 57,
+  "zombie_writes_blocked": 2,
+  "duplicate_actions_blocked": 3,
+  "tasks_deduplicated": 1,
+  "semantic_loop_blocks": 0,
+  "cost_units": 101,
+  "cost_comparison": {"all_junior": 57, "all_senior": 684, "tiered": 101}
+}

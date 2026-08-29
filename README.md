@@ -325,6 +325,40 @@ POOL_TIER=junior python -m worker.main # junior worker
 POOL_TIER=senior python -m worker.main # senior worker
 ```
 
+## Local verification mode
+
+The implementation also includes a SQLite-backed runtime for fast local testing.
+It exercises the same invariants without requiring Postgres to be running.
+
+```bash
+cd Reliable-AI-Agents
+python3 -m pip install -r requirements.txt
+python3 -m pytest tests -v
+```
+
+If `pytest` is not installed yet, the tests are plain functions and can still be
+run directly:
+
+```bash
+python3 - <<'PY'
+import importlib
+m = importlib.import_module("tests.test_invariants")
+for name in sorted(n for n in dir(m) if n.startswith("test_")):
+    getattr(m, name)()
+    print(f"PASS {name}")
+PY
+```
+
+To run the services locally against a file database:
+
+```bash
+export RUNTIME_DB=runtime.sqlite3
+uvicorn api.main:app --reload
+python3 -m orchestrator.main
+POOL_TIER=junior python3 -m worker.main
+POOL_TIER=senior python3 -m worker.main
+```
+
 ---
 
 ## Design notes
