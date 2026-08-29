@@ -86,24 +86,25 @@ class PoisonFailure(TaskFailure):
         super().__init__(detail, retryable_hint=False)
 
 
-# Convenience for the orchestrator: the ordered tier ladder.
-TIER_LADDER: tuple[str, ...] = ("junior", "senior")
+# ---------------------------------------------------------------------------
+# The escalation ladder lives in the `tiers` TABLE, not here. See common/tiers.py.
+# Adding a tier must never require editing code, so these are thin shims kept
+# only so existing imports keep working.
+# ---------------------------------------------------------------------------
 
 
 def next_tier(current: str) -> str | None:
-    """Return the tier above `current`, or None if already at the top."""
-    try:
-        idx = TIER_LADDER.index(current)
-    except ValueError:
-        return None
-    return TIER_LADDER[idx + 1] if idx + 1 < len(TIER_LADDER) else None
+    """Deprecated shim. Import from common.tiers instead."""
+    from common.tiers import next_tier as _next
+
+    return _next(current)
 
 
 def backoff_seconds(attempt: int, base: float = 2.0, cap: float = 30.0) -> float:
     """
     Exponential backoff for the retry path.
 
-    Deliberately capped: an uncapped backoff on a 10-minute hackathon demo means
-    a recovered task appears to hang, which reads as a bug on stage.
+    Deliberately capped: an uncapped backoff on a ten-minute demo makes a
+    recovered task look hung, which reads as a bug on stage.
     """
     return min(cap, base ** max(0, attempt))

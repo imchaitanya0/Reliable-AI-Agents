@@ -13,8 +13,8 @@ import json
 import logging
 from typing import Any
 
-from common.config import TIERS
 from common.failures import PoisonFailure, TaskFailure
+from common.tiers import cost_of
 from common.protocol import TaskContext, TaskDef
 from db.pool import pool
 
@@ -23,16 +23,18 @@ log = logging.getLogger(__name__)
 
 def load_registry() -> dict[int, TaskDef]:
     """
-    Resolve Lane A's registry lazily so the worker still imports cleanly before
-    that lane has landed.
-    """
-    try:
-        from tasks.registry import TASK_DEFS  # type: ignore[import-not-found]
+    Resolve the task registry.
 
-        return TASK_DEFS
-    except Exception:  # pragma: no cover - Lane A not merged yet
-        log.warning("tasks.registry unavailable -- worker has nothing to run")
-        return {}
+    Supports BOTH registration styles so no lane is blocked on the other:
+      * @task(...) decorators anywhere under tasks/  (preferred, pluggable)
+      * a legacy TASK_DEFS dict in tasks/registry.py
+
+    Adding a capability is one decorated function in a new file. Nothing in the
+    worker changes.
+    """
+    from common.registry import discover
+
+    return discover("tasks").as_dict()
 
 
 def idem_key(agent_id: str, seq: int, action_type: str) -> str:
@@ -147,5 +149,5 @@ def run_task(
                 (json.dumps(result), key),
             )
 
-    tier_cfg = TIERS.get(tier, TIERS["junior"])
-    return result, int(tier_cfg["cost_units"]), int(tier_cfg["tokens"]), False
+    cost, tokens = cost_of(tier)
+    return result, cost, tokens, False

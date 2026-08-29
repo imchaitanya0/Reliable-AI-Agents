@@ -43,6 +43,42 @@ CREATE TABLE IF NOT EXISTS agents (
 
 
 -- -----------------------------------------------------------------------------
+-- tiers — the escalation ladder, as DATA
+-- -----------------------------------------------------------------------------
+-- Adding a capability tier is one INSERT, not a migration and not a code change.
+-- `rank` ascending means more capable and more expensive; promotion walks to the
+-- next rank up, and the top rank is where a task stops being retryable.
+--
+-- This table is the SINGLE SOURCE OF TRUTH for the ladder. Nothing else may
+-- hardcode tier names.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS tiers (
+    name       TEXT PRIMARY KEY,
+    -- DEFERRABLE so a tier can be inserted BETWEEN two existing ones: shifting
+    -- the ranks above it transiently duplicates a value, which a non-deferrable
+    -- constraint would reject mid-transaction. Extending the ladder in the
+    -- middle is a legitimate operation, so the schema has to allow it.
+    rank       INT  NOT NULL,
+    CONSTRAINT tiers_rank_uk UNIQUE (rank) DEFERRABLE INITIALLY IMMEDIATE,
+    cost_units INT  NOT NULL,
+    tokens     INT  NOT NULL,
+    latency_ms INT  NOT NULL,
+    p_success  REAL NOT NULL DEFAULT 1.0,
+    model      TEXT                        -- null while tiers are simulated
+);
+
+INSERT INTO tiers (name, rank, cost_units, tokens, latency_ms, p_success) VALUES
+    ('junior', 1,  1, 1200,  400, 0.75),
+    ('senior', 2, 12, 3000, 1800, 0.95)
+ON CONFLICT (name) DO NOTHING;
+
+-- To add a third tier, this is the entire change:
+--   INSERT INTO tiers VALUES ('principal', 3, 60, 8000, 4000, 0.99, NULL);
+-- Promotion, cost accounting and the worker pools all pick it up with no code
+-- change. Start a pool with POOL_TIER=principal and it drains.
+
+
+-- -----------------------------------------------------------------------------
 -- task_instances — the queue, the lease and the checkpoint, in one row
 -- -----------------------------------------------------------------------------
 -- tier is the escalation axis and the single most important column in the
@@ -85,8 +121,12 @@ CREATE TABLE IF NOT EXISTS task_instances (
     -- two responsibilities apart is what lets the orchestrator stay stateless.
     CONSTRAINT task_instances_status_ck
         CHECK (status IN ('pending', 'running', 'succeeded', 'failed', 'dead')),
-    CONSTRAINT task_instances_tier_ck
-        CHECK (tier IN ('junior', 'senior')),
+    -- FK, not a CHECK: the ladder is data, so a new tier needs no DDL.
+    CONSTRAINT task_instances_tier_fk
+        FOREIGN KEY (tier) REFERENCES tiers(name),
+    -- Deliberately CLOSED, unlike tier. These three are exhaustive: the machine
+    -- broke, the attempt failed on its merits, or nothing can fix it. A fourth
+    -- would have no distinct routing, so this is a real taxonomy and not a gap.
     CONSTRAINT task_instances_failure_class_ck
         CHECK (failure_class IS NULL
                OR failure_class IN ('INFRA', 'CAPABILITY', 'POISON'))

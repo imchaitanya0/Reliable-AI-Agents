@@ -24,12 +24,9 @@ WORKER_ID = os.getenv("WORKER_ID", f"worker-{os.getpid()}")
 WORKER_POLL_SECONDS = float(os.getenv("WORKER_POLL_SECONDS", "0.5"))
 ORCHESTRATOR_POLL_SECONDS = float(os.getenv("ORCHESTRATOR_POLL_SECONDS", "2.0"))
 
-# Simulated tiers. Real models (Haiku junior, Opus senior) are a stretch goal --
-# simulation keeps the demo fast, free and reproducible on stage.
-TIERS: dict[str, dict[str, float]] = {
-    "junior": {"latency_ms": 400, "cost_units": 1, "tokens": 1200, "p_success": 0.75},
-    "senior": {"latency_ms": 1800, "cost_units": 12, "tokens": 3000, "p_success": 0.95},
-}
+# Tier definitions live in the `tiers` TABLE (see db/schema.sql and
+# common/tiers.py) so that adding a capability tier is one INSERT rather than a
+# code change. Nothing here may duplicate them -- two sources of truth drift.
 
 # Mock tools: fixed latency plus an injectable failure rate.
 TOOLS: dict[str, dict] = {
