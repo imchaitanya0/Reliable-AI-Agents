@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import os
-from typing import Any
+import time
+from typing import Any, Optional
 
-from db.pool import open_runtime_db
+from db.pool import open_runtime_db, utc_now
 from orchestrator.main import run_once as orchestrator_step
 from tasks.registry import TASK_DEFS
 from worker.main import run_once as worker_step
@@ -73,6 +74,12 @@ if app:
       <button class="secondary" onclick="step('both', 20)">Run 20 Steps</button>
     </section>
     <section>
+      <h2>Prove Failure Guarantees</h2>
+      <button onclick="prove('zombie')">Prove Zombie Fencing</button>
+      <button onclick="prove('idempotency')">Prove Idempotency</button>
+      <button onclick="prove('reaper')">Prove Batched Reaper</button>
+    </section>
+    <section>
       <h2>Metrics</h2>
       <div id="metrics" class="grid"></div>
     </section>
@@ -121,6 +128,11 @@ if app:
     }
     async function resetRuntime() {
       await post('/reset', {});
+      await refresh();
+    }
+    async function prove(name) {
+      const result = await post(`/chaos/prove/${name}`, {});
+      document.getElementById('raw').textContent = JSON.stringify(result, null, 2);
       await refresh();
     }
     function metric(label, value) {
@@ -253,3 +265,80 @@ if app:
             if key in allowed:
                 db.set_config(key, value)
         return {key: db.get_config(key) for key in allowed}
+
+    @app.post("/chaos/prove/zombie")
+    def prove_zombie() -> dict[str, Any]:
+        agent_id = db.create_agent([1])
+        stale = db.claim_task("junior", "chaos-stale-worker", lease_ttl=1)
+        if stale is None:
+            raise HTTPException(status_code=409, detail="no task was claimable for zombie proof")
+        db.conn.execute("UPDATE task_instances SET lease_expires=? WHERE id=?", (utc_now() - 1, stale["id"]))
+        reclaimed = db.reap_expired(batch_size=100, jitter_seconds=0)
+        fresh = db.claim_task("junior", "chaos-fresh-worker", lease_ttl=30)
+        if fresh is None:
+            raise HTTPException(status_code=409, detail="reclaimed task was not claimable")
+        fresh_write = db.complete_task(fresh, "chaos-fresh-worker", {"winner": "fresh"})
+        stale_write = db.complete_task(stale, "chaos-stale-worker", {"winner": "stale"})
+        return {
+            "agent_id": agent_id,
+            "expired_leases_reclaimed": len(reclaimed),
+            "fresh_worker_write_committed": fresh_write,
+            "stale_zombie_write_committed": stale_write,
+            "agent": db.get_agent(agent_id),
+            "metrics": db.metrics(),
+        }
+
+    @app.post("/chaos/prove/idempotency")
+    def prove_idempotency() -> dict[str, Any]:
+        agent_id = db.create_agent([8], query_text=f"idempotency proof {time.time()}")
+        key = f"proof:{agent_id}:jira"
+        state, _ = db.reserve_idempotency(key, agent_id, 0, "jira")
+        fired = {"count": 0}
+
+        def fire() -> dict[str, Any]:
+            fired["count"] += 1
+            return {"ticket": "JIRA-PROOF"}
+
+        duplicate_state, duplicate_result = db.run_idempotent(key, agent_id, 0, "jira", fire)
+        return {
+            "agent_id": agent_id,
+            "first_reservation": state,
+            "duplicate_state_seen": duplicate_state,
+            "duplicate_result": duplicate_result,
+            "actual_tool_fires_on_duplicate": fired["count"],
+            "metrics": db.metrics(),
+        }
+
+    @app.post("/chaos/prove/reaper")
+    def prove_reaper(payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        payload = payload or {}
+        count = int(payload.get("count", 500))
+        batch_size = int(payload.get("batch_size", 100))
+        task_ids = []
+        for i in range(count):
+            db.create_agent([1])
+            task = db.claim_task("junior", f"chaos-reaper-{i}", lease_ttl=1)
+            if task is not None:
+                task_ids.append(task["id"])
+                db.conn.execute("UPDATE task_instances SET lease_expires=? WHERE id=?", (utc_now() - 1, task["id"]))
+        started = time.time()
+        reclaimed = 0
+        while reclaimed < len(task_ids):
+            batch = db.reap_expired(batch_size=batch_size, jitter_seconds=5)
+            if not batch:
+                break
+            reclaimed += len(batch)
+        elapsed = time.time() - started
+        spread_row = db.conn.execute(
+            "SELECT MAX(next_run_at)-MIN(next_run_at) AS spread FROM task_instances WHERE id IN (%s)"
+            % ",".join("?" for _ in task_ids),
+            task_ids,
+        ).fetchone() if task_ids else {"spread": 0}
+        return {
+            "created_expired_leases": len(task_ids),
+            "reclaimed": reclaimed,
+            "batch_size": batch_size,
+            "elapsed_seconds": elapsed,
+            "next_run_at_spread_seconds": spread_row["spread"] or 0,
+            "metrics": db.metrics(),
+        }
