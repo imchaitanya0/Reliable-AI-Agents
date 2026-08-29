@@ -117,6 +117,17 @@ def seed_agent(plan: list[int], tiers: list[str] | None = None) -> str:
     depend on that lane. Note every row starts at tier='junior' -- the claim
     query's `t.seq = a.cursor` predicate is what stops them all running at once.
     """
+    # Mirrors api/main.py: tasks start at the base tier UNLESS force_tier pins
+    # them. The baseline comparisons are worthless if this helper diverges from
+    # what the API actually does.
+    if tiers is None:
+        try:
+            from common.runtime import force_tier
+            default_tier = force_tier() or "junior"
+        except Exception:
+            default_tier = "junior"
+        tiers = [default_tier] * len(plan)
+
     with pool().connection() as conn, conn.cursor() as cur:
         cur.execute(
             "INSERT INTO agents (plan, status) VALUES (%s, 'running') RETURNING id",
@@ -127,7 +138,7 @@ def seed_agent(plan: list[int], tiers: list[str] | None = None) -> str:
             cur.execute(
                 """INSERT INTO task_instances (agent_id, seq, task_def_id, tier)
                    VALUES (%s, %s, %s, %s)""",
-                (agent_id, seq, task_def_id, (tiers or ["junior"] * len(plan))[seq]),
+                (agent_id, seq, task_def_id, tiers[seq]),
             )
     return str(agent_id)
 

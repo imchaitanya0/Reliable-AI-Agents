@@ -37,6 +37,10 @@ REPO = Path(__file__).resolve().parents[1]
 LEASE_TTL = 3          # short, so recovery is observable inside a test
 ORCH_POLL = 0.5
 EASY = [1, 2, 1]       # fixture registry: all fast, all succeed
+# Task 3 sleeps (SLOW_TASK_SECONDS=1.0 in _env). A crash test needs a task
+# genuinely in flight -- with an all-fast plan the kill lands BETWEEN tasks
+# and strands nothing, so the scenario silently tests nothing.
+CRASH = [1, 3, 2]
 HARD = [1, 4, 2]       # task 4 fails on junior, succeeds on senior
 
 
@@ -124,7 +128,7 @@ class TestScene1WorkerFailure:
     N_AGENTS = 8
 
     def test_every_agent_completes_after_a_worker_is_killed(self):
-        agent_ids = [seed_agent(EASY) for _ in range(self.N_AGENTS)]
+        agent_ids = [seed_agent(CRASH) for _ in range(self.N_AGENTS)]
         procs = [spawn_worker(f"w{i}") for i in range(1, 4)]
         procs.append(spawn_orchestrator("orch-1"))
 
@@ -160,15 +164,15 @@ class TestScene1WorkerFailure:
         # 'completed' and would be wrong.
         for agent_id in agent_ids:
             agent = get_agent(agent_id)
-            assert agent["cursor"] == len(EASY)
-            assert sorted(int(k) for k in agent["context"]) == list(range(len(EASY)))
+            assert agent["cursor"] == len(CRASH)
+            assert sorted(int(k) for k in agent["context"]) == list(range(len(CRASH)))
 
     def test_recovery_is_recorded_as_evidence(self):
         """
         A reclaim nobody recorded makes "% tasks recovered" a guess. The killed
         worker cannot write its own attempt row, so the reaper writes it.
         """
-        seed_agent(EASY)
+        seed_agent(CRASH)
         procs = [spawn_worker("w1"), spawn_orchestrator("orch-1")]
         try:
             assert wait_until(lambda: tasks_running() >= 1, timeout=20)
@@ -189,7 +193,7 @@ class TestScene1WorkerFailure:
         its lease, and no agent stuck with an empty queue.
         """
         for _ in range(4):
-            seed_agent(EASY)
+            seed_agent(CRASH)
         procs = [spawn_worker("w1"), spawn_worker("w2"), spawn_orchestrator("o1")]
         try:
             assert wait_until(lambda: tasks_running() >= 1, timeout=20)
@@ -219,7 +223,7 @@ class TestScene2OrchestratorFailure:
     def test_work_completes_with_an_orchestrator_killed_mid_run(self):
         n = 4
         for _ in range(n):
-            seed_agent(EASY)
+            seed_agent(CRASH)
 
         workers = [spawn_worker("w1"), spawn_worker("w2")]
         orchestrators = [spawn_orchestrator("o1"), spawn_orchestrator("o2")]
@@ -246,7 +250,7 @@ class TestScene2OrchestratorFailure:
         holding, the same lease would be reclaimed twice and the recovery metric
         would over-report.
         """
-        seed_agent(EASY)
+        seed_agent(CRASH)
         procs = [spawn_worker("w1"), spawn_orchestrator("o1"), spawn_orchestrator("o2")]
         try:
             assert wait_until(lambda: tasks_running() >= 1, timeout=20)
