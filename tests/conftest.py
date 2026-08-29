@@ -12,7 +12,7 @@ import os
 import time
 
 os.environ.setdefault(
-    "DATABASE_URL", "postgresql://postgres:postgres@localhost:55432/rai"
+    "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/rai"
 )
 os.environ.setdefault("LEASE_TTL_SECONDS", "3")
 
