@@ -543,6 +543,36 @@ class RuntimeDB:
         agent["tasks"] = tasks
         return agent
 
+    def list_agents(self) -> list[dict[str, Any]]:
+        agents = []
+        rows = self.conn.execute("SELECT * FROM agents ORDER BY created_at DESC").fetchall()
+        for row in rows:
+            agent = dict(row)
+            agent["plan"] = decode_json(agent["plan"], [])
+            agent["context"] = decode_json(agent["context"], {})
+            agent["query_embedding"] = decode_json(agent["query_embedding"], [])
+            agents.append(agent)
+        return agents
+
+    def recent_attempts(self, limit: int = 50) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT a.*, t.task_def_id
+            FROM attempts a
+            JOIN task_instances t ON t.id = a.task_instance_id
+            ORDER BY a.id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def reset_runtime(self) -> None:
+        with self.transaction():
+            for table in ("dlq", "attempts", "idempotency", "task_instances", "agents"):
+                self.conn.execute(f"DELETE FROM {table}")
+            self.conn.execute("UPDATE metrics_counters SET value=0")
+
     def metrics(self) -> dict[str, Any]:
         counters = {
             row["key"]: row["value"]

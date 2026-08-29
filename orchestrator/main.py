@@ -17,8 +17,11 @@ def run_once(db, batch_size: int = 100) -> dict[str, int]:
 def main() -> None:
     db = open_runtime_db()
     interval = float(os.getenv("ORCHESTRATOR_INTERVAL_SECONDS", "2"))
+    print(f"[orchestrator] running db={db.path}", flush=True)
     while True:
-        run_once(db)
+        result = run_once(db)
+        if result["reclaimed"] or result["routed"]:
+            print(f"[orchestrator] reclaimed={result['reclaimed']} routed={result['routed']}", flush=True)
         time.sleep(interval)
 
 
