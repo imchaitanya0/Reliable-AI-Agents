@@ -1,0 +1,239 @@
+-- =============================================================================
+-- CONTRACT C5 — DATABASE SCHEMA
+-- =============================================================================
+-- This is the load-bearing contract. Every lane codes against it, and it is the
+-- only file that must land before parallel work begins.
+--
+-- Postgres is the durable queue, the lease table, the checkpoint store and the
+-- idempotency ledger all at once. Using one transactional system is what makes
+-- the reliability claims true rather than merely likely.
+--
+-- CHANGING THIS FILE MID-HACKATHON COSTS THE WHOLE TEAM. Discuss first.
+-- =============================================================================
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto;   -- gen_random_uuid()
+
+
+-- -----------------------------------------------------------------------------
+-- agents — one row per agent run
+-- -----------------------------------------------------------------------------
+-- An agent is a PLAN OF TASK IDS executed in sequence. Because the plan is data
+-- and not code, the agent is fully serializable and resumable at exact task
+-- granularity: `cursor` is the resume point, `context` is everything learned so
+-- far.
+--
+-- cost_units / tokens_used are ACCOUNTING ONLY. Nothing enforces them, and
+-- nothing terminates an agent for exceeding them. They exist so the three-way
+-- cost benchmark has real numbers.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS agents (
+    id           UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    plan         INT[]       NOT NULL,
+    cursor       INT         NOT NULL DEFAULT 0,      -- index into plan[]; the resume point
+    status       TEXT        NOT NULL DEFAULT 'running',
+    context      JSONB       NOT NULL DEFAULT '{}'::jsonb,  -- {seq: result} accumulated
+    cost_units   INT         NOT NULL DEFAULT 0,
+    tokens_used  INT         NOT NULL DEFAULT 0,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    CONSTRAINT agents_status_ck
+        CHECK (status IN ('pending', 'running', 'completed', 'failed'))
+);
+
+
+-- -----------------------------------------------------------------------------
+-- task_instances — the queue, the lease and the checkpoint, in one row
+-- -----------------------------------------------------------------------------
+-- tier is the escalation axis and the single most important column in the
+-- system. A worker pool only claims rows matching its own tier, so promoting a
+-- task is nothing more than an UPDATE of this field.
+--
+-- INVARIANT: promotion is scoped to the TASK, never the agent. When a promoted
+-- task succeeds, the NEXT task_instance is created at tier='junior' again. If
+-- promotion ever leaks onto the agent row, cost silently converges on the
+-- all-senior baseline and the project's central claim evaporates.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS task_instances (
+    id                    UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    agent_id              UUID        NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    seq                   INT         NOT NULL,       -- position in agents.plan
+    task_def_id           INT         NOT NULL,       -- key into tasks/registry.py
+    status                TEXT        NOT NULL DEFAULT 'pending',
+
+    tier                  TEXT        NOT NULL DEFAULT 'junior',
+    attempt               INT         NOT NULL DEFAULT 0,   -- attempts AT THE CURRENT TIER
+    max_attempts_per_tier INT         NOT NULL DEFAULT 2,
+
+    -- leasing: a worker must renew before lease_expires or the reaper reclaims
+    lease_owner           TEXT,
+    lease_expires         TIMESTAMPTZ,
+
+    next_run_at           TIMESTAMPTZ NOT NULL DEFAULT now(),  -- exponential backoff gate
+
+    result                JSONB,
+    last_error            TEXT,
+    failure_class         TEXT,
+
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    CONSTRAINT task_instances_agent_seq_uk UNIQUE (agent_id, seq),
+    CONSTRAINT task_instances_status_ck
+        CHECK (status IN ('pending', 'running', 'succeeded', 'dead')),
+    CONSTRAINT task_instances_tier_ck
+        CHECK (tier IN ('junior', 'senior')),
+    CONSTRAINT task_instances_failure_class_ck
+        CHECK (failure_class IS NULL
+               OR failure_class IN ('INFRA', 'CAPABILITY', 'POISON'))
+);
+
+-- Drives the claim query. Partial index keeps it small: only pending rows are
+-- ever scanned for work.
+CREATE INDEX IF NOT EXISTS task_instances_claim_idx
+    ON task_instances (tier, next_run_at)
+    WHERE status = 'pending';
+
+-- Drives the reaper sweep.
+CREATE INDEX IF NOT EXISTS task_instances_lease_idx
+    ON task_instances (lease_expires)
+    WHERE status = 'running';
+
+CREATE INDEX IF NOT EXISTS task_instances_agent_idx
+    ON task_instances (agent_id);
+
+
+-- -----------------------------------------------------------------------------
+-- idempotency — turns at-least-once delivery into exactly-once EFFECT
+-- -----------------------------------------------------------------------------
+-- You cannot distinguish a crashed worker from a slow one. That is a real
+-- impossibility result, not a gap in the design. So the runtime does not try:
+-- it reclaims on lease expiry and accepts that a slow-but-alive worker and its
+-- replacement will SOMETIMES run the same task concurrently.
+--
+-- This table is the defence. Before any externally visible action, the task
+-- writes sha256(agent_id:seq:action) here with ON CONFLICT DO NOTHING. If the
+-- insert affected zero rows, the action already happened; return the stored
+-- result instead of doing it twice.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS idempotency (
+    key         TEXT        PRIMARY KEY,     -- sha256(agent_id:seq:action_type)
+    agent_id    UUID        NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    seq         INT         NOT NULL,
+    action_type TEXT        NOT NULL,
+    result      JSONB       NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+
+-- -----------------------------------------------------------------------------
+-- attempts — not a log. This table IS the evidence.
+-- -----------------------------------------------------------------------------
+-- Every number on the dashboard is computed from here: escalation rate, cost
+-- versus the all-senior baseline, recovery time, tasks re-executed after a
+-- crash versus what a naive full restart would have redone.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS attempts (
+    id               BIGSERIAL   PRIMARY KEY,
+    task_instance_id UUID        NOT NULL REFERENCES task_instances(id) ON DELETE CASCADE,
+    agent_id         UUID        NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    seq              INT         NOT NULL,
+    attempt_no       INT         NOT NULL,
+    tier             TEXT        NOT NULL,
+    worker_id        TEXT,
+    outcome          TEXT        NOT NULL,   -- 'succeeded' | 'failed' | 'reclaimed'
+    failure_class    TEXT,
+    cost_units       INT         NOT NULL DEFAULT 0,
+    tokens           INT         NOT NULL DEFAULT 0,
+    started_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ended_at         TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS attempts_agent_idx    ON attempts (agent_id);
+CREATE INDEX IF NOT EXISTS attempts_outcome_idx  ON attempts (outcome);
+CREATE INDEX IF NOT EXISTS attempts_tier_idx     ON attempts (tier);
+
+
+-- -----------------------------------------------------------------------------
+-- dlq — terminal failures, with the history that got them there
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS dlq (
+    id            BIGSERIAL   PRIMARY KEY,
+    agent_id      UUID        NOT NULL,
+    seq           INT         NOT NULL,
+    task_def_id   INT         NOT NULL,
+    failure_class TEXT        NOT NULL,
+    last_error    TEXT,
+    attempt_trail JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+
+-- -----------------------------------------------------------------------------
+-- runtime_config — chaos + benchmark flags, readable by every process
+-- -----------------------------------------------------------------------------
+-- A metric only persuades next to its control. These flags let the demo run the
+-- all-junior and all-senior baselines live, and inject tool failures on stage.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS runtime_config (
+    key   TEXT PRIMARY KEY,
+    value JSONB NOT NULL
+);
+
+INSERT INTO runtime_config (key, value) VALUES
+    ('retries_enabled',    'true'::jsonb),
+    ('escalation_enabled', 'true'::jsonb),
+    ('force_tier',         'null'::jsonb),   -- null | "junior" | "senior"
+    ('lease_ttl_seconds',  '30'::jsonb),
+    ('tool_overrides',     '{}'::jsonb)      -- {"jira": {"failure_rate": 1.0}}
+ON CONFLICT (key) DO NOTHING;
+
+
+-- =============================================================================
+-- THE CLAIM QUERY — this is the entire scheduler
+-- =============================================================================
+-- Kept here as documentation; worker/claim.py executes it.
+--
+--   UPDATE task_instances SET
+--     status='running', lease_owner=%(worker)s,
+--     lease_expires=now() + make_interval(secs => %(ttl)s),
+--     attempt=attempt+1, updated_at=now()
+--   WHERE id = (
+--     SELECT t.id FROM task_instances t
+--     JOIN agents a ON a.id = t.agent_id
+--     WHERE t.status='pending'
+--       AND t.next_run_at <= now()      -- backoff gate
+--       AND t.tier = %(pool_tier)s      -- junior pool ignores escalated work
+--       AND a.status = 'running'
+--       AND t.seq = a.cursor            -- <- the sequential dependency
+--     ORDER BY t.next_run_at
+--     FOR UPDATE SKIP LOCKED LIMIT 1    -- <- mutual exclusion, never blocks
+--   ) RETURNING *;
+--
+-- Two lines carry the whole design:
+--
+--   t.seq = a.cursor         No task is claimable until its predecessor commits
+--                            and advances the cursor. Dependency ordering, free.
+--                            Swap this for a deps_satisfied check and you have
+--                            full DAG support.
+--
+--   FOR UPDATE SKIP LOCKED   Two workers never claim the same row and never wait
+--                            on each other. This replaces an entire consensus
+--                            protocol — which is why there is no leader election
+--                            and no single point of failure.
+-- =============================================================================
+
+
+-- =============================================================================
+-- THE REAPER — crash recovery in full
+-- =============================================================================
+-- Runs in every orchestrator instance every 2s. Note it requeues at the SAME
+-- tier: a dead machine says nothing about model capability.
+--
+--   UPDATE task_instances SET
+--     status='pending', lease_owner=NULL, failure_class='INFRA',
+--     next_run_at = now() + make_interval(secs => backoff(attempt)),
+--     updated_at=now()
+--   WHERE status='running' AND lease_expires < now()
+--   RETURNING id, agent_id, seq;
+-- =============================================================================
