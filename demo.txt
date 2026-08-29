@@ -63,12 +63,23 @@ docker compose exec -T postgres psql -U postgres -d rai -q -c \
        running out."
 ===============================================================================
 
-# 1.1  Submit 20 agents on the demo workload.
-#      seed() mixes easy and hard plans on purpose: that mix is what produces
-#      a realistic escalation rate. Submitting one uniform hard plan would
-#      make the rate an artefact of the fixture rather than a property of the
-#      runtime -- and it would read as ~20%, not the ~7% the pitch quotes.
-.venv/bin/python -m chaos.harness seed 20
+# 1.1  Submit 20 agents as a MIXED workload. This matters more than it looks.
+#
+#      `seed` applies ONE pipeline to every agent it creates. Seeding 20 on
+#      `investigation` gives every agent the hard task 21, so every agent
+#      escalates and the dashboard reads 20% -- which is an artefact of the
+#      fixture, not a property of the runtime, and a judge who notices will
+#      be right to.
+#
+#      Two seeds produce an honest workload: mostly easy plans, some with a
+#      hard task in them. Measured: 6.0% escalation, 0.14x all-senior --
+#      exactly the numbers in the pitch.
+.venv/bin/python -m chaos.harness seed 14 --pipeline quick-triage
+.venv/bin/python -m chaos.harness seed 6  --pipeline investigation
+
+#      Which tasks are hard (fail on junior, succeed on senior): 20, 21, 23,
+#      31, 51. quick-triage [1,2,10,30,41] has none; investigation
+#      [1,10,21,40,41] has one. That ratio is the escalation rate.
 
 # 1.2  Let work get genuinely in flight. Watch the left pane: tasks running.
 sleep 5
@@ -126,7 +137,7 @@ docker kill $(docker compose ps -q orchestrator | head -1)
 docker kill $(docker compose ps -q worker-junior | head -1)
 
 # 2.3  Submit more work and watch it complete anyway.
-.venv/bin/python -m chaos.harness seed 10
+.venv/bin/python -m chaos.harness seed 10 --pipeline quick-triage
 
 # 2.4  SAY: "One orchestrator left, one worker down, and the queue still
 #            drains. There was nothing to fail over, because there was nothing
@@ -183,7 +194,8 @@ curl -s -X POST localhost:8000/chaos/tool \
 #      dead-letter instead of promoting.
 curl -s -X POST localhost:8000/chaos/config \
   -H 'content-type: application/json' -d '{"escalation_enabled":false}'
-.venv/bin/python -m chaos.harness seed 20
+.venv/bin/python -m chaos.harness seed 14 --pipeline quick-triage
+.venv/bin/python -m chaos.harness seed 6  --pipeline investigation
 # ...wait for it to settle, then:
 .venv/bin/python -m chaos.harness status
 # SAY: "Cheapest -- and look at the dead-letter queue. It does not finish the
@@ -195,7 +207,8 @@ docker compose exec -T postgres psql -U postgres -d rai -q -c \
 curl -s -X POST localhost:8000/chaos/config \
   -H 'content-type: application/json' \
   -d '{"escalation_enabled":true,"force_tier":"senior"}'
-.venv/bin/python -m chaos.harness seed 20
+.venv/bin/python -m chaos.harness seed 14 --pipeline quick-triage
+.venv/bin/python -m chaos.harness seed 6  --pipeline investigation
 .venv/bin/python -m chaos.harness status
 # SAY: "Finishes everything. Twelve times the price for every task, including
 #       the ones a cheap model handled perfectly well."
@@ -205,7 +218,8 @@ docker compose exec -T postgres psql -U postgres -d rai -q -c \
   "TRUNCATE agents, task_instances, attempts, idempotency, dlq CASCADE;"
 curl -s -X POST localhost:8000/chaos/config \
   -H 'content-type: application/json' -d '{"force_tier":null}'
-.venv/bin/python -m chaos.harness seed 20
+.venv/bin/python -m chaos.harness seed 14 --pipeline quick-triage
+.venv/bin/python -m chaos.harness seed 6  --pipeline investigation
 .venv/bin/python -m chaos.harness status
 # THE LINE: "All-junior is cheapest and leaves work permanently unfinished.
 #            All-senior finishes everything at twelve times the cost.
@@ -279,9 +293,9 @@ docker compose up -d --scale orchestrator=2
 .venv/bin/python -m chaos.harness tasks
 .venv/bin/python -m chaos.harness pipelines
 #      Known-good plans:
-#        investigation   1,10,21,40,41
-#        quick-triage    1,2,10,30,41
-#        smoke           1,30
+#        investigation   1,10,21,40,41   (one hard task -> escalates)
+#        quick-triage    1,2,10,30,41    (no hard tasks -> never escalates)
+#        smoke           1,30            (two tasks, fastest)
 
 # Port 5432 already in use
 #   -> This machine runs its own PostgreSQL 14. Always export
@@ -291,8 +305,9 @@ docker compose up -d --scale orchestrator=2
 docker compose logs api | tail -20
 
 # Escalation rate looks like 20%, not ~7%
-#   -> You submitted a uniform hard plan through POST /agents. Use
-#      `chaos.harness seed`, which mixes easy and hard plans on purpose.
+#   -> You seeded ONE pipeline. `seed` applies a single plan to every agent it
+#      creates, so seeding only `investigation` means every agent carries the
+#      hard task. Seed the mix in Block 1.1 instead.
 
 # Recovery takes 30 seconds and the room goes quiet
 #   -> LEASE_TTL_SECONDS was not set. Bring the stack up with
