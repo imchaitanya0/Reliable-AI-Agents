@@ -43,6 +43,42 @@ CREATE TABLE IF NOT EXISTS agents (
 
 
 -- -----------------------------------------------------------------------------
+-- tiers — the escalation ladder, as DATA
+-- -----------------------------------------------------------------------------
+-- Adding a capability tier is one INSERT, not a migration and not a code change.
+-- `rank` ascending means more capable and more expensive; promotion walks to the
+-- next rank up, and the top rank is where a task stops being retryable.
+--
+-- This table is the SINGLE SOURCE OF TRUTH for the ladder. Nothing else may
+-- hardcode tier names.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS tiers (
+    name       TEXT PRIMARY KEY,
+    -- DEFERRABLE so a tier can be inserted BETWEEN two existing ones: shifting
+    -- the ranks above it transiently duplicates a value, which a non-deferrable
+    -- constraint would reject mid-transaction. Extending the ladder in the
+    -- middle is a legitimate operation, so the schema has to allow it.
+    rank       INT  NOT NULL,
+    CONSTRAINT tiers_rank_uk UNIQUE (rank) DEFERRABLE INITIALLY IMMEDIATE,
+    cost_units INT  NOT NULL,
+    tokens     INT  NOT NULL,
+    latency_ms INT  NOT NULL,
+    p_success  REAL NOT NULL DEFAULT 1.0,
+    model      TEXT                        -- null while tiers are simulated
+);
+
+INSERT INTO tiers (name, rank, cost_units, tokens, latency_ms, p_success) VALUES
+    ('junior', 1,  1, 1200,  400, 0.75),
+    ('senior', 2, 12, 3000, 1800, 0.95)
+ON CONFLICT (name) DO NOTHING;
+
+-- To add a third tier, this is the entire change:
+--   INSERT INTO tiers VALUES ('principal', 3, 60, 8000, 4000, 0.99, NULL);
+-- Promotion, cost accounting and the worker pools all pick it up with no code
+-- change. Start a pool with POOL_TIER=principal and it drains.
+
+
+-- -----------------------------------------------------------------------------
 -- task_instances — the queue, the lease and the checkpoint, in one row
 -- -----------------------------------------------------------------------------
 -- tier is the escalation axis and the single most important column in the
@@ -79,10 +115,18 @@ CREATE TABLE IF NOT EXISTS task_instances (
     updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     CONSTRAINT task_instances_agent_seq_uk UNIQUE (agent_id, seq),
+    -- 'failed' means: an attempt finished unsuccessfully and is AWAITING
+    -- ORCHESTRATOR ROUTING. The worker reports what happened; the orchestrator
+    -- decides whether that means retry, promote, or dead-letter. Keeping those
+    -- two responsibilities apart is what lets the orchestrator stay stateless.
     CONSTRAINT task_instances_status_ck
-        CHECK (status IN ('pending', 'running', 'succeeded', 'dead')),
-    CONSTRAINT task_instances_tier_ck
-        CHECK (tier IN ('junior', 'senior')),
+        CHECK (status IN ('pending', 'running', 'succeeded', 'failed', 'dead')),
+    -- FK, not a CHECK: the ladder is data, so a new tier needs no DDL.
+    CONSTRAINT task_instances_tier_fk
+        FOREIGN KEY (tier) REFERENCES tiers(name),
+    -- Deliberately CLOSED, unlike tier. These three are exhaustive: the machine
+    -- broke, the attempt failed on its merits, or nothing can fix it. A fourth
+    -- would have no distinct routing, so this is a real taxonomy and not a gap.
     CONSTRAINT task_instances_failure_class_ck
         CHECK (failure_class IS NULL
                OR failure_class IN ('INFRA', 'CAPABILITY', 'POISON'))
@@ -102,6 +146,12 @@ CREATE INDEX IF NOT EXISTS task_instances_lease_idx
 CREATE INDEX IF NOT EXISTS task_instances_agent_idx
     ON task_instances (agent_id);
 
+-- Drives the orchestrator's classification sweep: rows a worker has reported on
+-- but nobody has routed yet.
+CREATE INDEX IF NOT EXISTS task_instances_failed_idx
+    ON task_instances (updated_at)
+    WHERE status = 'failed';
+
 
 -- -----------------------------------------------------------------------------
 -- idempotency — turns at-least-once delivery into exactly-once EFFECT
@@ -112,18 +162,57 @@ CREATE INDEX IF NOT EXISTS task_instances_agent_idx
 -- replacement will SOMETIMES run the same task concurrently.
 --
 -- This table is the defence. Before any externally visible action, the task
--- writes sha256(agent_id:seq:action) here with ON CONFLICT DO NOTHING. If the
--- insert affected zero rows, the action already happened; return the stored
--- result instead of doing it twice.
+-- reserves sha256(agent_id:seq:action) here. A retry that finds the key knows
+-- the action already happened and returns the stored result instead of doing it
+-- twice.
+--
+-- THE LEDGER IS TWO-PHASE, AND IT HAS TO BE
+-- -----------------------------------------
+-- Read the failure this table exists for closely:
+--
+--     create Jira ticket -> SUCCESS -> worker dies before acknowledging
+--       -> retry -> check action id -> already executed -> do not duplicate
+--
+-- The crash is AFTER the action succeeds. So a ledger row written after the
+-- fact cannot help: the window between "ticket created" and "row committed" is
+-- exactly where the worker dies, the retry finds no key, and a second ticket is
+-- created. Worse, it fails silently -- `SELECT count(*) FROM idempotency` still
+-- answers 1 while two tickets exist, so the obvious check passes.
+--
+-- A single-phase ledger cannot close that window, because the result does not
+-- exist until the action has already had its effect. Hence two phases:
+--
+--   state='in_flight'  reserved BEFORE the action. It may or may not have run.
+--   state='done'       settled AFTER it succeeded; `result` is authoritative.
+--
+-- A retry that finds 'in_flight' must NOT act: either a twin is mid-action, or
+-- a worker died in the window. Both mean the effect may already exist. That
+-- ambiguity is real, and orchestrator/ledger.py reports it rather than guessing.
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS idempotency (
     key         TEXT        PRIMARY KEY,     -- sha256(agent_id:seq:action_type)
     agent_id    UUID        NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
     seq         INT         NOT NULL,
     action_type TEXT        NOT NULL,
-    result      JSONB       NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+
+    state       TEXT        NOT NULL DEFAULT 'in_flight',
+    result      JSONB,                       -- NULL until settled
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    settled_at  TIMESTAMPTZ,
+
+    CONSTRAINT idempotency_state_ck
+        CHECK (state IN ('in_flight', 'done')),
+    -- A settled row with no result would let a replay hand back NULL as if it
+    -- were the answer the action produced.
+    CONSTRAINT idempotency_settled_has_result_ck
+        CHECK (state <> 'done' OR result IS NOT NULL)
 );
+
+-- Drives the audit sweep: reservations that outlived the lease that would have
+-- let their owner settle them.
+CREATE INDEX IF NOT EXISTS idempotency_in_flight_idx
+    ON idempotency (created_at)
+    WHERE state = 'in_flight';
 
 
 -- -----------------------------------------------------------------------------
@@ -236,4 +325,29 @@ ON CONFLICT (key) DO NOTHING;
 --     updated_at=now()
 --   WHERE status='running' AND lease_expires < now()
 --   RETURNING id, agent_id, seq;
+-- =============================================================================
+
+
+-- =============================================================================
+-- TASK_INSTANCE STATE MACHINE
+-- =============================================================================
+--   pending   --claim-------------------> running     worker took the lease
+--   running   --success-----------------> succeeded   result committed, cursor++
+--   running   --raises TaskFailure------> failed      awaiting orchestrator
+--   running   --lease expired-----------> pending     reaper, INFRA, same tier
+--   failed    --INFRA or retries left---> pending     same tier, backoff
+--   failed    --CAPABILITY, tier spent--> pending     tier='senior', attempt=0
+--   failed    --POISON or top tier------> dead        written to dlq
+--
+-- The worker only ever moves rows into 'succeeded' or 'failed'. Every routing
+-- decision belongs to the orchestrator. That separation is what keeps the
+-- orchestrator stateless and horizontally scalable.
+--
+-- NOTE ON WHO CREATES TASK ROWS: the API inserts the agent AND every
+-- task_instance of its plan in one transaction, all at tier='junior'. The
+-- claim query's `t.seq = a.cursor` predicate is what gates execution order, so
+-- nothing runs early. This means the worker's checkpoint never INSERTs -- it
+-- only marks succeeded and advances the cursor -- and a promoted task cannot
+-- leak its tier onto its successor, because the successor row already exists
+-- at 'junior'.
 -- =============================================================================

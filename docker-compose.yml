@@ -1,0 +1,36 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: rai
+    ports: ["5432:5432"]
+    volumes:
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d rai"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  # Junior pool: cheap, fails sometimes. Scale this one freely.
+  #   docker compose up -d --scale worker-junior=5
+  worker-junior:
+    build: .
+    command: python -m worker.main
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/rai
+      POOL_TIER: junior
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  # Senior pool: expensive, drains escalations only. ~7% of tasks reach it,
+  # which is why it scales independently and stays small.
+  worker-senior:
+    build: .
+    command: python -m worker.main
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/rai
+      POOL_TIER: senior
+    depends_on:
+      postgres: {condition: service_healthy}

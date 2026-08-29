@@ -1,70 +1,95 @@
 """
-Lane A — Benchmark Task Registry (Contract C2)
-==============================================
-
-Provides standard 9 benchmark tasks.
-Extendable simply by adding new entries to TASK_DEFS.
+The task registry -- Lane A.
+Standard 9-task benchmark registry and extensible decorators.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+from common.failures import CapabilityFailure
 from common.protocol import TaskContext, TaskDef
-from tasks.tools import call_mock_tool
+from common.registry import registry, task
+from common.tiers import base_tier
+from tasks import tools
 
 
-def task_fetch_logs(ctx: TaskContext) -> dict[str, Any]:
-    logs = call_mock_tool("logs", "query_recent", {"service": "payment-service"})
-    return {"status": "success", "logs": logs["log_lines"]}
+def _needs_a_bigger_model(ctx: TaskContext, what: str) -> None:
+    """A hard task is beyond the base tier, by construction."""
+    if ctx.tier == base_tier() or ctx.tier == "junior":
+        raise CapabilityFailure(
+            f"{what}: base tier could not produce a usable answer. Model capability bound.",
+            retryable_hint=True,
+        )
 
 
-def task_fetch_github(ctx: TaskContext) -> dict[str, Any]:
-    commits = call_mock_tool("github", "list_recent_commits", {"repo": "org/payment-svc"})
-    return {"status": "success", "commits": commits["commits"]}
+# --- standard 9 benchmark tasks ---------------------------------------------
+
+@task(1, name="fetch_logs", tool="logs")
+def fetch_logs(ctx: TaskContext) -> dict[str, Any]:
+    res = tools.call_mock_tool("logs", "query_recent", {"service": "payment-service"})
+    return {"status": "success", "logs": res.get("log_lines", []), "intent": "investigate_payment_failure"}
 
 
-def task_inspect_jira(ctx: TaskContext) -> dict[str, Any]:
-    jira_data = call_mock_tool("jira", "search_recent_incidents", {"query": "payment"})
-    return {"status": "success", "jira_data": jira_data}
+@task(2, name="fetch_github", tool="github")
+def fetch_github(ctx: TaskContext) -> dict[str, Any]:
+    res = tools.call_mock_tool("github", "list_recent_commits", {"repo": "org/payment-svc"})
+    return {"status": "success", "commits": res.get("commits", []), "recent_deploys": 2}
 
 
-def task_parse_telemetry(ctx: TaskContext) -> dict[str, Any]:
+@task(3, name="inspect_jira", tool="jira")
+def inspect_jira(ctx: TaskContext) -> dict[str, Any]:
+    res = tools.call_mock_tool("jira", "search_recent_incidents", {"query": "payment"})
+    return {"status": "success", "jira_data": res, "open_incidents": 3}
+
+
+@task(4, name="parse_telemetry")
+def parse_telemetry(ctx: TaskContext) -> dict[str, Any]:
     prior_logs = ctx.prior.get(0, {}).get("logs", [])
     error_count = len([line for line in prior_logs if "ERROR" in line])
     return {"status": "success", "error_count": error_count, "telemetry_parsed": True}
 
 
-def task_query_db_health(ctx: TaskContext) -> dict[str, Any]:
+@task(5, name="query_db_health")
+def query_db_health(ctx: TaskContext) -> dict[str, Any]:
     return {"status": "success", "db_status": "HIGH_LOAD", "connection_usage": "95%"}
 
 
-def task_root_cause_analysis(ctx: TaskContext) -> dict[str, Any]:
-    # Hard reasoning task: synthesizes logs and commits
+@task(6, name="root_cause_analysis", difficulty="hard")
+def root_cause_analysis(ctx: TaskContext) -> dict[str, Any]:
+    """The escalation showcase. Sees everything prior tasks found."""
+    _needs_a_bigger_model(ctx, "root cause analysis")
     prior_logs = ctx.prior.get(0, {}).get("logs", [])
     prior_commits = ctx.prior.get(1, {}).get("commits", [])
     return {
         "status": "success",
-        "root_cause": "Database connection exhaustion caused by unindexed query introduced in commit a1b2c3d",
+        "root_cause": "connection pool exhaustion after deploy a1b2c3d",
         "confidence": 0.98,
+        "solved_by": ctx.tier,
         "evidence": {"log_count": len(prior_logs), "commit_count": len(prior_commits)},
+        "evidence_from_steps": sorted(ctx.prior.keys()),
     }
 
 
-def task_generate_patch(ctx: TaskContext) -> dict[str, Any]:
-    # Hard synthesis task
-    rc = ctx.prior.get(2, {}).get("root_cause", "Database connection exhaustion")
+@task(7, name="generate_patch", difficulty="hard")
+def generate_patch(ctx: TaskContext) -> dict[str, Any]:
+    _needs_a_bigger_model(ctx, "patch synthesis")
     return {
         "status": "success",
         "patch_diff": "--- a/db.py\n+++ b/db.py\n@@ -10 +10 @@\n-MAX_CONN=20\n+MAX_CONN=100\n",
         "target_service": "payment-service",
+        "solved_by": ctx.tier,
     }
 
 
-def task_create_remediation_ticket(ctx: TaskContext) -> dict[str, Any]:
-    # Side-effecting task: guarded by idempotency key
+@task(8, name="create_remediation_ticket", tool="jira", side_effecting=True)
+def create_remediation_ticket(ctx: TaskContext) -> dict[str, Any]:
+    """
+    The idempotency showcase. Reclaim-on-timeout means this WILL sometimes run
+    twice; the key in the executor is what stops two tickets existing.
+    """
     key = ctx.key_for("task:create_remediation_ticket")
-    ticket = call_mock_tool(
+    ticket = tools.call_mock_tool(
         "jira",
         "create_issue",
         {
@@ -73,10 +98,11 @@ def task_create_remediation_ticket(ctx: TaskContext) -> dict[str, Any]:
             "idempotency_key": key,
         },
     )
-    return {"status": "success", "ticket": ticket, "idempotency_key": key}
+    return {"status": "success", "ticket": ticket, "idempotency_key": key, "created": True}
 
 
-def task_post_incident_summary(ctx: TaskContext) -> dict[str, Any]:
+@task(9, name="post_incident_summary")
+def post_incident_summary(ctx: TaskContext) -> dict[str, Any]:
     return {
         "status": "success",
         "summary": "Incident investigated and remediation ticket created successfully.",
@@ -84,15 +110,8 @@ def task_post_incident_summary(ctx: TaskContext) -> dict[str, Any]:
     }
 
 
-# Standard Benchmark Registry
-TASK_DEFS: dict[int, TaskDef] = {
-    1: TaskDef(id=1, name="fetch_logs", run=task_fetch_logs, difficulty="easy", tool="logs"),
-    2: TaskDef(id=2, name="fetch_github", run=task_fetch_github, difficulty="easy", tool="github"),
-    3: TaskDef(id=3, name="inspect_jira", run=task_inspect_jira, difficulty="easy", tool="jira"),
-    4: TaskDef(id=4, name="parse_telemetry", run=task_parse_telemetry, difficulty="easy"),
-    5: TaskDef(id=5, name="query_db_health", run=task_query_db_health, difficulty="easy"),
-    6: TaskDef(id=6, name="root_cause_analysis", run=task_root_cause_analysis, difficulty="hard"),
-    7: TaskDef(id=7, name="generate_patch", run=task_generate_patch, difficulty="hard"),
-    8: TaskDef(id=8, name="create_remediation_ticket", run=task_create_remediation_ticket, difficulty="easy", side_effecting=True, tool="jira"),
-    9: TaskDef(id=9, name="post_incident_summary", run=task_post_incident_summary, difficulty="easy"),
-}
+# Export dictionary for compatibility
+TASK_DEFS: dict[int, TaskDef] = registry.as_dict()
+
+DEMO_PLAN = [1, 2, 6, 8, 9]
+EASY_PLAN = [1, 2, 3, 7, 9]

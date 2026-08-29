@@ -1,94 +1,105 @@
 """
-Lane C — Task Execution & Idempotency Enforcement
-=================================================
-
-Executes TaskDefs with TaskContext and wraps side-effects with deterministic idempotency keys.
+Lane C — Task Execution & Idempotency Enforcement.
+Runs one TaskDef against an agent's accumulated context.
 """
 
 from __future__ import annotations
 
-import json
+import logging
 from typing import Any
 
-from common.failures import (
-    CapabilityFailure,
-    InfraFailure,
-    PoisonFailure,
-    TaskFailure,
-)
-from common.protocol import TaskContext
-from db.pool import get_conn
-from tasks.registry import TASK_DEFS
-from tasks.tiers import execute_with_tier
+from common.failures import InfraFailure, PoisonFailure, TaskFailure
+from common.protocol import TaskContext, TaskDef
+from common.tiers import cost_of
+from db.pool import pool
+from orchestrator import ledger
+
+log = logging.getLogger(__name__)
 
 
-def execute_claimed_task(task_row: dict[str, Any]) -> tuple[dict[str, Any], int]:
+def load_registry() -> dict[int, TaskDef]:
+    """Resolve the task registry."""
+    from common.registry import discover
+    return discover("tasks").as_dict()
+
+
+def idem_key(agent_id: str, seq: int, action_type: str) -> str:
+    """Deterministic key for an externally visible action."""
+    return ledger.action_id(agent_id, seq, action_type)
+
+
+def run_task(
+    task_row: dict[str, Any],
+    agent_row: dict[str, Any],
+    registry: dict[int, TaskDef] | None = None,
+) -> tuple[dict[str, Any], int, int, bool]:
     """
-    Execute a claimed task row against accumulated agent context.
-    Returns (result, cost_units).
-    Raises TaskFailure subclasses (InfraFailure, CapabilityFailure, PoisonFailure).
+    Execute one task.
+    Returns (result, cost_units, tokens, was_duplicate).
     """
+    registry = load_registry() if registry is None else registry
+
+    task_def_id = task_row["task_def_id"]
+    task_def = registry.get(task_def_id)
+    if task_def is None:
+        raise PoisonFailure(f"task_def_id {task_def_id} not in registry")
+
     agent_id = str(task_row["agent_id"])
-    seq = int(task_row["seq"])
-    task_def_id = int(task_row["task_def_id"])
-    tier = str(task_row["tier"])
+    seq = task_row["seq"]
+    tier = task_row["tier"]
 
-    # 1. Fetch Agent Context & Plan
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT context, plan FROM agents WHERE id = %s;", (agent_id,))
-            agent = cur.fetchone()
-            if not agent:
-                raise PoisonFailure(f"Agent {agent_id} not found in database.")
+    prior_raw = agent_row.get("context") or {}
+    prior = {int(k): v for k, v in prior_raw.items()}
 
-    prior_context = {int(k): v for k, v in agent["context"].items()} if agent["context"] else {}
-
-    # 2. Build TaskContext
     ctx = TaskContext(
         agent_id=agent_id,
         seq=seq,
-        tier=tier,  # type: ignore
-        prior=prior_context,
+        tier=tier,
+        prior=prior,
+        idem_key=lambda action, a=agent_id, s=seq: idem_key(a, s, action),
     )
 
-    # 3. Lookup TaskDef in Registry
-    task_def = TASK_DEFS.get(task_def_id)
-    if not task_def:
-        raise PoisonFailure(f"Unknown task_def_id={task_def_id}. Not registered in TASK_DEFS.")
-
-    # 4. Check Idempotency Table if Task is Side-Effecting
+    action_key: str | None = None
     if task_def.side_effecting:
-        idem_key = ctx.key_for(f"task:{task_def.name}")
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT result FROM idempotency WHERE key = %s;", (idem_key,))
-                cached = cur.fetchone()
-                if cached:
-                    # Exactly-once effect hit: return stored result without re-executing
-                    return cached["result"], 1 if tier == "junior" else 12
+        status, stored, action_key = ledger.begin(agent_id, seq, f"task:{task_def_id}")
 
-    # 5. Execute Task with Tier Enforcement
+        if status == ledger.DONE:
+            log.info("duplicate suppressed agent=%s seq=%s", agent_id, seq)
+            return stored or {}, 0, 0, True
+
+        if status == ledger.IN_FLIGHT:
+            # If in flight, check idempotency table fallback
+            with pool().connection() as conn, conn.cursor() as cur:
+                cur.execute("SELECT result FROM idempotency WHERE key = %s;", (action_key,))
+                cached = cur.fetchone()
+                if cached and cached.get("result"):
+                    return cached["result"], 0, 0, True
+
     try:
-        result = execute_with_tier(task_def, ctx)
+        result = task_def.run(ctx)
     except TaskFailure:
         raise
     except Exception as exc:
-        # Unhandled code error/crash is classified as InfraFailure
-        raise InfraFailure(f"Execution error in {task_def.name}: {exc}") from exc
+        raise InfraFailure(f"{type(exc).__name__}: {exc}") from exc
 
-    # 6. Store Idempotency Record if Side-Effecting
-    if task_def.side_effecting:
-        idem_key = ctx.key_for(f"task:{task_def.name}")
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO idempotency (key, agent_id, seq, action_type, result)
-                    VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (key) DO NOTHING;
-                    """,
-                    (idem_key, agent_id, seq, f"task:{task_def.name}", json.dumps(result)),
-                )
+    if not isinstance(result, dict):
+        raise PoisonFailure(f"task {task_def_id} returned {type(result).__name__}, expected dict")
 
-    cost_units = 1 if tier == "junior" else 12
-    return result, cost_units
+    if action_key is not None:
+        ledger.settle(action_key, result)
+
+    cost, tokens = cost_of(tier)
+    return result, cost, tokens, False
+
+
+def execute_claimed_task(task_row: dict[str, Any]) -> tuple[dict[str, Any], int]:
+    """Compatibility wrapper returning (result, cost_units)."""
+    agent_id = str(task_row["agent_id"])
+    with pool().connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT * FROM agents WHERE id = %s;", (agent_id,))
+        agent_row = cur.fetchone()
+        if not agent_row:
+            raise PoisonFailure(f"Agent {agent_id} not found in database.")
+
+    result, cost, tokens, _ = run_task(task_row, agent_row)
+    return result, cost

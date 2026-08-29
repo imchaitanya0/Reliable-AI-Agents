@@ -1,50 +1,53 @@
 """
-Lane C — Atomic Task Claim Query (Contract C5)
-==============================================
+THE CLAIM QUERY -- this is the entire scheduler (Lane C).
 
-Uses FOR UPDATE SKIP LOCKED to claim work without locks, leader election, or consensus.
+There is no scheduler process. Dependency ordering, tier routing and mutual
+exclusion all fall out of one statement.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-import psycopg
-from db.pool import get_conn
+from db.pool import pool
+
+CLAIM_SQL = """
+UPDATE task_instances SET
+    status        = 'running',
+    lease_owner   = %(worker_id)s,
+    lease_expires = now() + make_interval(secs => %(ttl)s),
+    attempt       = attempt + 1,
+    updated_at    = now()
+WHERE id = (
+    SELECT t.id
+    FROM task_instances t
+    JOIN agents a ON a.id = t.agent_id
+    WHERE t.status      = 'pending'
+      AND t.next_run_at <= now()          -- backoff gate
+      AND t.tier        = %(pool_tier)s   -- junior pool ignores escalated work
+      AND a.status      = 'running'
+      AND t.seq         = a.cursor        -- <- the sequential dependency
+    ORDER BY t.next_run_at
+    FOR UPDATE OF t SKIP LOCKED           -- <- mutual exclusion, never blocks
+    LIMIT 1
+)
+RETURNING id, agent_id, seq, task_def_id, tier, attempt,
+          max_attempts_per_tier, lease_expires;
+"""
 
 
-def claim_task(worker_id: str, pool_tier: str, ttl_seconds: int = 30) -> dict[str, Any] | None:
+def claim_one(pool_tier: str, worker_id: str, ttl_seconds: int = 30) -> dict[str, Any] | None:
     """
-    Claim one runnable task matching the worker pool's tier.
-    Enforces sequential DAG ordering (t.seq = a.cursor) and exponential backoff gating (t.next_run_at <= now()).
+    Atomically take the next runnable task for this tier, or return None.
     """
-    query = """
-    UPDATE task_instances SET
-        status = 'running',
-        lease_owner = %(worker_id)s,
-        lease_expires = now() + make_interval(secs => %(ttl)s),
-        attempt = attempt + 1,
-        updated_at = now()
-    WHERE id = (
-        SELECT t.id FROM task_instances t
-        JOIN agents a ON a.id = t.agent_id
-        WHERE t.status = 'pending'
-          AND t.next_run_at <= now()
-          AND t.tier = %(pool_tier)s
-          AND a.status = 'running'
-          AND t.seq = a.cursor
-        ORDER BY t.next_run_at
-        FOR UPDATE SKIP LOCKED LIMIT 1
-    )
-    RETURNING id, agent_id, seq, task_def_id, tier, attempt, max_attempts_per_tier;
-    """
-
-    with get_conn() as conn:
+    with pool().connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(query, {"worker_id": worker_id, "ttl": ttl_seconds, "pool_tier": pool_tier})
+            cur.execute(
+                CLAIM_SQL,
+                {"worker_id": worker_id, "ttl": ttl_seconds, "pool_tier": pool_tier},
+            )
             row = cur.fetchone()
             if row:
-                # Log attempt start in attempts table
                 cur.execute(
                     """
                     INSERT INTO attempts (task_instance_id, agent_id, seq, attempt_no, tier, worker_id, outcome, started_at)
@@ -56,3 +59,8 @@ def claim_task(worker_id: str, pool_tier: str, ttl_seconds: int = 30) -> dict[st
                 attempt_row = cur.fetchone()
                 row["attempt_id"] = attempt_row["id"] if attempt_row else None
             return row
+
+
+def claim_task(worker_id: str, pool_tier: str, ttl_seconds: int = 30) -> dict[str, Any] | None:
+    """Alias for claim_one."""
+    return claim_one(pool_tier=pool_tier, worker_id=worker_id, ttl_seconds=ttl_seconds)

@@ -1,58 +1,85 @@
 """
-Lane C — Background Task Lease Renewal (Heartbeat)
-==================================================
-
-Renews task leases periodically while execution is actively running.
+Lease renewal (Lane C).
+A worker renews every LEASE_TTL/3; the reaper reclaims anything whose lease_expires has passed.
 """
 
 from __future__ import annotations
 
+import logging
 import threading
-import time
 from contextlib import contextmanager
 from typing import Generator
 
-from common.config import HEARTBEAT_INTERVAL_SECONDS, LEASE_TTL_SECONDS
-from db.pool import get_conn
+from common.config import HEARTBEAT_INTERVAL, LEASE_TTL_SECONDS
+from db.pool import pool
+
+log = logging.getLogger(__name__)
+
+RENEW_SQL = """
+UPDATE task_instances
+SET lease_expires = now() + make_interval(secs => %(ttl)s),
+    updated_at    = now()
+WHERE id          = %(task_id)s
+  AND (lease_owner = %(worker_id)s OR %(worker_id)s IS NULL)
+  AND status      = 'running'
+"""
 
 
-class HeartbeatThread(threading.Thread):
-    def __init__(self, task_id: str, ttl_seconds: int = LEASE_TTL_SECONDS, interval_seconds: float = HEARTBEAT_INTERVAL_SECONDS) -> None:
-        super().__init__(daemon=True)
+class Heartbeat:
+    """
+    Renews the lease on a background thread until stopped.
+    """
+
+    def __init__(self, task_id: str, worker_id: str | None = None, ttl_seconds: int = LEASE_TTL_SECONDS, interval: float = HEARTBEAT_INTERVAL):
         self.task_id = task_id
-        self.ttl_seconds = ttl_seconds
-        self.interval_seconds = interval_seconds
-        self._stop_event = threading.Event()
+        self.worker_id = worker_id
+        self.ttl = ttl_seconds
+        self.interval = interval
+        self.lost = False
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
 
-    def run(self) -> None:
-        while not self._stop_event.wait(self.interval_seconds):
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
             try:
-                with get_conn() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            """
-                            UPDATE task_instances
-                            SET lease_expires = now() + make_interval(secs => %(ttl)s),
-                                updated_at = now()
-                            WHERE id = %(task_id)s AND status = 'running';
-                            """,
-                            {"task_id": self.task_id, "ttl": self.ttl_seconds},
-                        )
+                with pool().connection() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        RENEW_SQL,
+                        {
+                            "ttl": self.ttl,
+                            "task_id": self.task_id,
+                            "worker_id": self.worker_id,
+                        },
+                    )
+                    if cur.rowcount == 0:
+                        self.lost = True
+                        log.warning("lease lost task=%s worker=%s -- abandoning", self.task_id, self.worker_id)
+                        return
             except Exception:
-                # If connection dropped temporarily, continue until stop event
-                pass
+                log.exception("heartbeat renewal failed task=%s", self.task_id)
+
+    def start(self) -> "Heartbeat":
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
 
     def stop(self) -> None:
-        self._stop_event.set()
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+    def __enter__(self) -> "Heartbeat":
+        return self.start()
+
+    def __exit__(self, *exc: object) -> None:
+        self.stop()
 
 
 @contextmanager
-def task_heartbeat(task_id: str, ttl_seconds: int = LEASE_TTL_SECONDS, interval_seconds: float = HEARTBEAT_INTERVAL_SECONDS) -> Generator[None, None, None]:
-    """Context manager to start and cleanly stop background heartbeats for a task."""
-    hb = HeartbeatThread(task_id, ttl_seconds, interval_seconds)
+def task_heartbeat(task_id: str, ttl_seconds: int = LEASE_TTL_SECONDS, interval_seconds: float = HEARTBEAT_INTERVAL) -> Generator[Heartbeat, None, None]:
+    hb = Heartbeat(task_id=task_id, worker_id=None, ttl_seconds=ttl_seconds, interval=interval_seconds)
     hb.start()
     try:
-        yield
+        yield hb
     finally:
         hb.stop()
-        hb.join(timeout=2.0)
