@@ -1,16 +1,19 @@
 """
-The task registry -- Lane A.
+The task library.
 
 Adding a capability is ONE decorated function. Nothing in the worker,
-orchestrator or API changes. Drop a new file in this package and `discover()`
-picks it up on the next worker restart.
+orchestrator or API changes -- `discover()` imports this package and the
+decorators register themselves.
+
+IDS ARE GROUPED BY PHASE so the space stays extensible:
+    1-9    intake        30-39  decide
+   10-19   observe       40-49  act (side-effecting)
+   20-29   analyse       50-59  verify
 
 DIFFICULTY IS THE ESCALATION LEVER
 ----------------------------------
-Tasks marked difficulty="hard" fail DETERMINISTICALLY on the base tier and
-succeed on a higher one. Probability would make the escalation demo a coin flip
-on stage; determinism makes it reproducible, which is what you want when a room
-is watching.
+difficulty="hard" fails DETERMINISTICALLY on the base tier and succeeds higher
+up. Probability would make the escalation demo a coin flip on stage.
 """
 
 from __future__ import annotations
@@ -22,83 +25,170 @@ from common.tiers import base_tier
 from tasks import tools
 
 
-def _needs_a_bigger_model(ctx: TaskContext, what: str) -> None:
+def _hard(ctx: TaskContext, what: str) -> None:
     """A hard task is beyond the base tier, by construction."""
     if ctx.tier == base_tier():
-        raise CapabilityFailure(f"{what}: base tier could not produce a usable answer")
+        raise CapabilityFailure(f"{what}: base tier produced no usable answer")
 
 
-# --- the investigation workflow ---------------------------------------------
+# --- 1-9 intake --------------------------------------------------------------
 
 @task(1, name="parse-request")
 def parse_request(ctx: TaskContext) -> dict:
-    return {"intent": "investigate_payment_failure", "entities": ["payments-api"]}
+    return {"intent": "investigate_payment_failure", "service": "payments-api"}
 
 
-@task(2, name="search-logs", tool="logs")
+@task(2, name="classify-severity")
+def classify_severity(ctx: TaskContext) -> dict:
+    return {"severity": "sev2", "customer_facing": True}
+
+
+@task(3, name="extract-entities")
+def extract_entities(ctx: TaskContext) -> dict:
+    return {"services": ["payments-api", "ledger"], "regions": ["us-east-1"]}
+
+
+# --- 10-19 observe (these call tools) ----------------------------------------
+
+@task(10, name="search-logs", tool="logs")
 def search_logs(ctx: TaskContext) -> dict:
-    tools.call("logs", {"query": "payments-api ERROR"})
-    return {"matches": 42, "top_error": "UpstreamTimeout on charge()"}
+    return {"logs": tools.call("logs", {"query": "payments-api ERROR"})}
 
 
-@task(3, name="check-github", tool="github")
-def check_github(ctx: TaskContext) -> dict:
-    tools.call("github", {"repo": "payments-api", "since": "24h"})
-    return {"recent_deploys": 2, "suspect_pr": "#8814"}
+@task(11, name="query-metrics", tool="metrics_db")
+def query_metrics(ctx: TaskContext) -> dict:
+    return {"metrics": tools.call("metrics_db", {"window": "1h"})}
 
 
-@task(4, name="read-jira", tool="jira")
+@task(12, name="check-deploys", tool="github")
+def check_deploys(ctx: TaskContext) -> dict:
+    return {"github": tools.call("github", {"repo": "psycopg/psycopg"})}
+
+
+@task(13, name="scan-codebase", tool="files")
+def scan_codebase(ctx: TaskContext) -> dict:
+    return {"scan": tools.call("files", {"pattern": "SKIP LOCKED"})}
+
+
+@task(14, name="run-diagnostics", tool="shell")
+def run_diagnostics(ctx: TaskContext) -> dict:
+    return {"diagnostics": tools.call("shell", {"cmd": "git-log"})}
+
+
+@task(15, name="fetch-status-page", tool="http")
+def fetch_status_page(ctx: TaskContext) -> dict:
+    return {"status_page": tools.call("http", {"url": "https://api.github.com/zen"})}
+
+
+@task(16, name="read-jira", tool="jira")
 def read_jira(ctx: TaskContext) -> dict:
-    tools.call("jira", {"jql": "project=PAY AND status!=Done"})
-    return {"open_incidents": 3}
+    return {"jira": tools.call("jira", {"action": "read"})}
 
 
-@task(5, name="correlate-incidents", difficulty="hard")
-def correlate_incidents(ctx: TaskContext) -> dict:
-    _needs_a_bigger_model(ctx, "correlation across incidents")
-    return {"correlated": True, "solved_by": ctx.tier}
+# --- 20-29 analyse (the expensive thinking) ----------------------------------
+
+@task(20, name="correlate-signals", difficulty="hard")
+def correlate_signals(ctx: TaskContext) -> dict:
+    _hard(ctx, "correlating signals across sources")
+    return {"correlated": True, "solved_by": ctx.tier, "sources": sorted(ctx.prior)}
 
 
-@task(6, name="root-cause-analysis", difficulty="hard")
+@task(21, name="root-cause-analysis", difficulty="hard")
 def root_cause_analysis(ctx: TaskContext) -> dict:
-    """The escalation showcase. Sees everything prior tasks found."""
-    _needs_a_bigger_model(ctx, "root cause analysis")
-    return {
-        "root_cause": "connection pool exhaustion after deploy #8814",
-        "confidence": 0.91,
-        "solved_by": ctx.tier,
-        "evidence_from_steps": sorted(ctx.prior),
-    }
+    _hard(ctx, "root cause analysis")
+    return {"root_cause": "connection pool exhaustion after deploy #8814",
+            "confidence": 0.91, "solved_by": ctx.tier,
+            "evidence_from_steps": sorted(ctx.prior)}
 
 
-@task(7, name="draft-summary")
+@task(22, name="assess-blast-radius")
+def assess_blast_radius(ctx: TaskContext) -> dict:
+    return {"affected_users": 12400, "regions": ["us-east-1"]}
+
+
+@task(23, name="rank-hypotheses", difficulty="hard")
+def rank_hypotheses(ctx: TaskContext) -> dict:
+    _hard(ctx, "ranking competing hypotheses")
+    return {"top": "pool exhaustion", "alternatives": 3, "solved_by": ctx.tier}
+
+
+# --- 30-39 decide ------------------------------------------------------------
+
+@task(30, name="draft-summary")
 def draft_summary(ctx: TaskContext) -> dict:
     return {"summary": "Payment failures traced to pool exhaustion.",
-            "based_on": sorted(ctx.prior)}
+            "based_on_steps": sorted(ctx.prior)}
 
 
-@task(8, name="create-jira-ticket", tool="jira", side_effecting=True)
+@task(31, name="recommend-remediation", difficulty="hard")
+def recommend_remediation(ctx: TaskContext) -> dict:
+    _hard(ctx, "recommending a remediation")
+    return {"action": "raise pool size to 60 and roll back #8814",
+            "solved_by": ctx.tier}
+
+
+@task(32, name="estimate-risk")
+def estimate_risk(ctx: TaskContext) -> dict:
+    return {"rollback_risk": "low", "eta_minutes": 15}
+
+
+# --- 40-49 act (SIDE-EFFECTING: every one needs an idempotency key) ----------
+
+@task(40, name="create-jira-ticket", tool="jira", side_effecting=True)
 def create_jira_ticket(ctx: TaskContext) -> dict:
-    """
-    The idempotency showcase. Reclaim-on-timeout means this WILL sometimes run
-    twice; the key in the executor is what stops two tickets existing.
-    """
-    tools.call("jira", {"action": "create"})
-    return {"ticket": "PAY-4471", "created": True}
+    return {"jira": tools.call("jira", {"action": "create"})}
 
 
-@task(9, name="notify-team")
-def notify_team(ctx: TaskContext) -> dict:
-    return {"notified": ["#payments-oncall"], "steps_seen": len(ctx.prior)}
+@task(41, name="notify-slack", tool="slack", side_effecting=True)
+def notify_slack(ctx: TaskContext) -> dict:
+    return {"slack": tools.call("slack", {"channel": "#payments-oncall"})}
 
 
-# Legacy-style export so anything importing TASK_DEFS keeps working.
+@task(42, name="page-oncall", tool="pagerduty", side_effecting=True)
+def page_oncall(ctx: TaskContext) -> dict:
+    return {"page": tools.call("pagerduty", {"severity": "sev2"})}
+
+
+@task(43, name="post-status-update", tool="http", side_effecting=True)
+def post_status_update(ctx: TaskContext) -> dict:
+    return {"posted": tools.call("http", {"url": "https://api.github.com/zen"})}
+
+
+# --- 50-59 verify ------------------------------------------------------------
+
+@task(50, name="verify-resolution")
+def verify_resolution(ctx: TaskContext) -> dict:
+    return {"resolved": True, "checks_passed": 4}
+
+
+@task(51, name="write-postmortem", difficulty="hard")
+def write_postmortem(ctx: TaskContext) -> dict:
+    _hard(ctx, "writing the postmortem")
+    return {"postmortem": "PM-118", "steps_covered": len(ctx.prior),
+            "solved_by": ctx.tier}
+
+
 TASK_DEFS = registry.as_dict()
 
-# The demo plan: parse -> search logs -> root cause (HARD, escalates)
-#                      -> create ticket (SIDE-EFFECTING) -> notify
-DEMO_PLAN = [1, 2, 6, 8, 9]
 
-# Most real work needs no escalation. This mix is what makes the observed
-# escalation rate land near 7% rather than being asserted into existence.
-EASY_PLAN = [1, 2, 3, 7, 9]
+# --- default pipelines -------------------------------------------------------
+# Seeded into the `pipelines` table on first run. Compose your own at runtime;
+# nothing here is privileged.
+DEFAULT_PIPELINES: dict[str, tuple[list[int], str]] = {
+    "smoke":              ([1, 30], "two steps, no tools -- fastest sanity check"),
+    "quick-triage":       ([1, 2, 10, 30, 41],
+                           "cheap path, no hard tasks, never escalates"),
+    "investigation":      ([1, 10, 21, 40, 41],
+                           "the demo plan: one hard task, one side effect"),
+    "deep-investigation": ([1, 3, 10, 11, 12, 20, 21, 31, 40, 42],
+                           "many observations, three hard steps"),
+    "code-audit":         ([1, 13, 14, 23, 30, 40],
+                           "filesystem + shell tools, one hard ranking step"),
+    "full-incident":      ([1, 2, 3, 10, 11, 12, 15, 20, 21, 22, 31, 32,
+                            40, 42, 41, 50, 51],
+                           "17 steps end to end -- the long-running showcase"),
+}
+
+# Kept for the existing demo scripts.
+DEMO_PLAN = DEFAULT_PIPELINES["investigation"][0]
+EASY_PLAN = DEFAULT_PIPELINES["quick-triage"][0]

@@ -239,6 +239,27 @@ INSERT INTO runtime_config (key, value) VALUES
 ON CONFLICT (key) DO NOTHING;
 
 
+-- -----------------------------------------------------------------------------
+-- pipelines — named plans, as DATA
+-- -----------------------------------------------------------------------------
+-- A pipeline is a reusable ordered list of task ids. Naming them means you
+-- compose new workflows at RUNTIME instead of hardcoding [1,2,6,8,9] at a call
+-- site:
+--
+--   INSERT INTO pipelines (name, plan, description)
+--   VALUES ('my-workflow', ARRAY[1,10,21,40], 'whatever I need today');
+--
+-- The API and the CLI both accept either a pipeline name or a raw plan array,
+-- so nothing is locked to a fixed set.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS pipelines (
+    name        TEXT PRIMARY KEY,
+    plan        INT[] NOT NULL,
+    description TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+
 -- =============================================================================
 -- THE CLAIM QUERY — this is the entire scheduler
 -- =============================================================================
