@@ -102,7 +102,7 @@ def test_invariant_3_idempotency_exactly_once_effect():
     # Verify recorded in DB
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) AS cnt FROM idempotency WHERE key = %s;", (key,))
+            cur.execute("SELECT COUNT(*) AS cnt FROM idempotency WHERE agent_id = %s AND seq = %s;", (agent_id, seq))
             assert cur.fetchone()["cnt"] == 1
 
     # Attempt 2 (Simulated replay): Must return stored result without re-executing
@@ -110,7 +110,7 @@ def test_invariant_3_idempotency_exactly_once_effect():
     assert res2 == res1
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) AS cnt FROM idempotency WHERE key = %s;", (key,))
+            cur.execute("SELECT COUNT(*) AS cnt FROM idempotency WHERE agent_id = %s AND seq = %s;", (agent_id, seq))
             assert cur.fetchone()["cnt"] == 1  # Exactly one!
 
 
@@ -157,9 +157,17 @@ def test_invariant_5_classification_and_routing():
             cur.execute(
                 """
                 INSERT INTO task_instances (id, agent_id, seq, task_def_id, status, tier, attempt, max_attempts_per_tier, failure_class)
-                VALUES (%s, %s, 0, 6, 'pending', 'junior', 2, 2, 'CAPABILITY');
+                VALUES (%s, %s, 0, 6, 'failed', 'junior', 2, 2, 'CAPABILITY');
                 """,
                 (task_id, agent_id),
+            )
+            cur.execute(
+                """
+                INSERT INTO attempts (task_instance_id, agent_id, seq, attempt_no, tier, outcome, failure_class)
+                VALUES (%s, %s, 0, 1, 'junior', 'failed', 'CAPABILITY'),
+                       (%s, %s, 0, 2, 'junior', 'failed', 'CAPABILITY');
+                """,
+                (task_id, agent_id, task_id, agent_id),
             )
 
     # Process failures: Must promote to senior!

@@ -72,10 +72,7 @@ WHERE task_instance_id = %(id)s
 def capability_attempts(cur, task: dict) -> int:
     cur.execute(CAPABILITY_ATTEMPTS_SQL, {"id": task["id"], "tier": task["tier"]})
     row = cur.fetchone()
-    count = row["n"] if row else 0
-    if count == 0 and task.get("attempt", 0) > 0:
-        return task["attempt"]
-    return count
+    return row["n"] if row else 0
 
 
 def _kill(cur, task: dict, reason: str) -> None:

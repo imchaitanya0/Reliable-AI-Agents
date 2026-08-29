@@ -46,19 +46,7 @@ def claim_one(pool_tier: str, worker_id: str, ttl_seconds: int = 30) -> dict[str
                 CLAIM_SQL,
                 {"worker_id": worker_id, "ttl": ttl_seconds, "pool_tier": pool_tier},
             )
-            row = cur.fetchone()
-            if row:
-                cur.execute(
-                    """
-                    INSERT INTO attempts (task_instance_id, agent_id, seq, attempt_no, tier, worker_id, outcome, started_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, 'running', now())
-                    RETURNING id;
-                    """,
-                    (row["id"], row["agent_id"], row["seq"], row["attempt"], row["tier"], worker_id),
-                )
-                attempt_row = cur.fetchone()
-                row["attempt_id"] = attempt_row["id"] if attempt_row else None
-            return row
+            return cur.fetchone()
 
 
 def claim_task(worker_id: str, pool_tier: str, ttl_seconds: int = 30) -> dict[str, Any] | None:

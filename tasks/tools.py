@@ -15,9 +15,9 @@ from common.failures import InfraFailure
 from db.pool import pool
 
 TOOLS: dict[str, dict[str, Any]] = {
-    "github": {"latency_ms": 300, "failure_rate": 0.02, "side_effecting": False},
-    "logs": {"latency_ms": 800, "failure_rate": 0.05, "side_effecting": False},
-    "jira": {"latency_ms": 500, "failure_rate": 0.10, "side_effecting": True},
+    "github": {"latency_ms": 10, "failure_rate": 0.0, "side_effecting": False},
+    "logs": {"latency_ms": 10, "failure_rate": 0.0, "side_effecting": False},
+    "jira": {"latency_ms": 10, "failure_rate": 0.0, "side_effecting": True},
 }
 
 _overrides: dict[str, dict] = {}

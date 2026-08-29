@@ -12,15 +12,16 @@ import os
 import subprocess
 import time
 
-os.environ.setdefault(
-    "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/rai"
-)
+from common.config import DATABASE_URL
+
+os.environ["DATABASE_URL"] = DATABASE_URL
 os.environ.setdefault("LEASE_TTL_SECONDS", "3")
 
 import pytest  # noqa: E402
 
 from common.failures import CapabilityFailure, InfraFailure, PoisonFailure  # noqa: E402
 from common.protocol import TaskContext, TaskDef  # noqa: E402
+from db.init_db import init_database
 from db.pool import pool  # noqa: E402
 
 # --- fixture task implementations -------------------------------------------
@@ -97,6 +98,7 @@ def _kill_stray_workers() -> None:
 
 @pytest.fixture(autouse=True)
 def clean_db():
+    init_database()
     _kill_stray_workers()
     _CALLS.clear()
     with pool().connection() as conn, conn.cursor() as cur:
