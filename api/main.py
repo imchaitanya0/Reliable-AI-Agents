@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field
 
 from chaos.harness import set_tool
 from common.metrics import snapshot
+from common.runtime import force_tier
 from common.tiers import all_tiers, base_tier
 from db.pool import close_pool, fetchall, fetchone, pool
 from tasks.registry import DEMO_PLAN, TASK_DEFS
@@ -132,7 +133,11 @@ def submit_agents(body: SubmitAgents) -> dict[str, list[str]]:
     if not body.plan:
         raise HTTPException(status_code=422, detail="plan must not be empty")
 
-    tier = base_tier()
+    # Normally the base tier -- promotion is scoped to a task, so work must
+    # start cheap. `force_tier` pins every task to one tier instead, which is
+    # how the all-junior and all-senior baselines are produced by this same
+    # system rather than estimated.
+    tier = force_tier() or base_tier()
     agent_ids: list[str] = []
 
     with pool().connection() as conn, conn.cursor() as cur:

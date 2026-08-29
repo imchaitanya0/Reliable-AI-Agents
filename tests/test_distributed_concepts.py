@@ -545,3 +545,213 @@ class TestReconciliation:
             )
         assert ledger.reconcile() == []
         assert ledger.lookup(key)["result"] == {"ticket": "PAY-1"}
+
+
+class TestInfraReclaimsDoNotDeadLetter:
+    """
+    The companion to TestInfraFailuresDoNotFundEscalation, and the worse of the
+    two failure modes: an over-promoted task still completes, a dead-lettered
+    one is simply lost.
+
+    `attempt` counts every handout, reclaims included. If the INFRA budget read
+    it, killing workers often enough would dead-letter perfectly healthy work --
+    and the demo kills workers on purpose.
+    """
+
+    def test_repeated_reclaims_do_not_exhaust_the_infra_budget(self):
+        from orchestrator.classify import MAX_INFRA_ATTEMPTS, infra_attempts
+        from tests.test_orchestrator import _reclaim
+
+        agent_id = seed_agent([1])
+        _reclaim(agent_id, times=MAX_INFRA_ATTEMPTS + 2)
+
+        task = get_tasks(agent_id)[0]
+        assert task["attempt"] > MAX_INFRA_ATTEMPTS, "the claim counter did advance"
+
+        with pool().connection() as conn, conn.cursor() as cur:
+            assert infra_attempts(cur, task) == 0, (
+                "machine deaths are not infra failures reported by a worker"
+            )
+
+    def test_a_much_killed_task_still_retries(self):
+        from orchestrator.classify import MAX_INFRA_ATTEMPTS
+        from tests.test_orchestrator import _fail, _reclaim
+
+        agent_id = seed_agent([1])
+        _reclaim(agent_id, times=MAX_INFRA_ATTEMPTS + 2)
+        _fail(agent_id, "INFRA", attempt=1)
+
+        assert classify()["retry"] == 1, "healthy work dead-lettered by worker kills"
+        assert get_tasks(agent_id)[0]["status"] == "pending"
+
+    def test_a_genuinely_broken_tool_still_dead_letters(self):
+        """The budget must still do its job: stop consuming worker slots."""
+        from orchestrator.classify import MAX_INFRA_ATTEMPTS
+        from tests.test_orchestrator import _fail
+
+        agent_id = seed_agent([1])
+        _fail(agent_id, "INFRA", attempt=MAX_INFRA_ATTEMPTS)
+        assert classify()["dlq"] == 1
+
+
+class TestRuntimeFlags:
+    """
+    The chaos switches must actually switch something.
+
+    They were written by /chaos/config and read by nothing, which made the
+    controls the benchmark depends on silent no-ops -- the worst kind of broken,
+    because the demo appears to work.
+    """
+
+    def _set(self, key: str, value: str) -> None:
+        from common import runtime
+
+        with pool().connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO runtime_config (key, value) VALUES (%s, %s::jsonb) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                (key, value),
+            )
+        runtime.invalidate()
+
+    @pytest.fixture(autouse=True)
+    def _restore(self):
+        yield
+        self._set("retries_enabled", "true")
+        self._set("escalation_enabled", "true")
+        self._set("force_tier", "null")
+
+    def test_retries_disabled_makes_a_failure_terminal(self):
+        from tests.test_orchestrator import _fail
+
+        self._set("retries_enabled", "false")
+        agent_id = seed_agent([1])
+        _fail(agent_id, "INFRA", attempt=1)
+
+        assert classify()["dlq"] == 1
+        assert get_tasks(agent_id)[0]["status"] == "dead"
+
+    def test_retries_enabled_is_the_control(self):
+        from tests.test_orchestrator import _fail
+
+        self._set("retries_enabled", "true")
+        agent_id = seed_agent([1])
+        _fail(agent_id, "INFRA", attempt=1)
+        assert classify()["retry"] == 1
+
+    def test_escalation_disabled_dead_letters_instead_of_promoting(self):
+        """
+        The all-junior baseline: cheaper, and it leaves work unfinished. The DLQ
+        entry is what makes the second half visible rather than assumed.
+        """
+        from tests.test_orchestrator import _fail
+
+        self._set("escalation_enabled", "false")
+        agent_id = seed_agent([4])
+        _fail(agent_id, "CAPABILITY", attempt=2)
+
+        assert classify()["dlq"] == 1
+        assert get_tasks(agent_id)[0]["tier"] == "junior", "must not have promoted"
+
+    def test_forced_tier_cannot_escalate(self):
+        from tests.test_orchestrator import _fail
+
+        self._set("force_tier", '"senior"')
+        agent_id = seed_agent([4], tiers=["senior"])
+        _fail(agent_id, "CAPABILITY", attempt=2, tier="senior")
+        assert classify()["dlq"] == 1
+
+
+class TestRunawayGuard:
+    def test_a_task_handed_out_forever_still_terminates(self):
+        from orchestrator.classify import MAX_TOTAL_ATTEMPTS
+        from tests.test_orchestrator import _fail
+
+        agent_id = seed_agent([1])
+        _fail(agent_id, "INFRA", attempt=MAX_TOTAL_ATTEMPTS)
+        assert classify()["dlq"] == 1
+
+
+class TestLedgerMetrics:
+    """
+    reconcile() closes an orphaned reservation with state='done'. Counting the
+    ledger by state alone therefore reports an unknown effect as a successful
+    guard, and loses the prevented-duplicate evidence precisely when it becomes
+    permanent.
+    """
+
+    def test_a_settled_action_counts_as_guarded(self, agent_id):
+        from common.metrics import snapshot
+
+        _, _, key = ledger.begin(agent_id, 0, "create_jira")
+        ledger.settle(key, {"ticket": "PAY-1"})
+
+        m = snapshot()["idempotency"]
+        assert m["actions_guarded"] == 1
+        assert m["duplicates_prevented"] == 0
+
+    def test_a_reconciled_action_counts_as_prevented_not_guarded(self, agent_id):
+        from common.metrics import snapshot
+
+        _, _, key = ledger.begin(agent_id, 0, "create_jira")
+        with pool().connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE idempotency SET created_at = now() - interval '10 min' "
+                "WHERE key=%s",
+                (key,),
+            )
+        ledger.reconcile()
+
+        m = snapshot()["idempotency"]
+        assert m["duplicates_prevented"] == 1, "evidence vanished once reconciled"
+        assert m["actions_guarded"] == 0, "an unknown effect is not a successful guard"
+
+
+class TestFailedAgentLeavesNoOrphans:
+    """
+    A dead-lettered task fails its agent, and the claim query requires
+    `a.status='running'` -- so every remaining task of that agent becomes
+    unclaimable. Left pending they are permanent garbage the queue still counts
+    as work, which on a dashboard reads as a backlog that never drains.
+    """
+
+    def _poison_first_task(self, plan: list[int]) -> str:
+        agent_id = seed_agent(plan)
+        with pool().connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE task_instances SET status='failed', failure_class='POISON' "
+                "WHERE agent_id=%s AND seq=0",
+                (agent_id,),
+            )
+        return agent_id
+
+    def test_remaining_tasks_are_cancelled(self):
+        agent_id = self._poison_first_task([6, 1, 2])
+        assert classify()["dlq"] == 1
+
+        statuses = [t["status"] for t in get_tasks(agent_id)]
+        assert statuses == ["dead", "dead", "dead"]
+        assert get_agent(agent_id)["status"] == "failed"
+
+    def test_queue_reports_no_claimable_work(self):
+        agent_id = self._poison_first_task([6, 1, 2])
+        classify()
+        assert queue.depth()["claimable"] == 0
+
+    def test_depth_ignores_tasks_of_stopped_agents(self):
+        """
+        Belt and braces: even if a row were somehow left pending under a stopped
+        agent, it must not be reported as work.
+        """
+        agent_id = seed_agent([1, 2])
+        with pool().connection() as conn, conn.cursor() as cur:
+            cur.execute("UPDATE agents SET status='failed' WHERE id=%s", (agent_id,))
+        assert queue.depth()["claimable"] == 0
+
+    def test_a_healthy_agent_is_untouched(self):
+        """Cancellation must be scoped to the failing agent only."""
+        healthy = seed_agent([1, 2])
+        self._poison_first_task([6, 1])
+        classify()
+        assert [t["status"] for t in get_tasks(healthy)] == ["pending", "pending"]
+        assert queue.depth()["claimable"] == 1

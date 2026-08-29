@@ -106,15 +106,20 @@ WHERE a.status = 'running'
   )
 """
 
+# Joined to agents and restricted to running ones, because the claim query is:
+# a task belonging to a stopped agent is in the table but is not work. Counting
+# it would report a backlog that nothing can ever drain.
 DEPTH_SQL = """
 SELECT
-    count(*) FILTER (WHERE status = 'pending' AND next_run_at <= now()) AS claimable,
-    count(*) FILTER (WHERE status = 'pending' AND next_run_at >  now()) AS scheduled,
-    count(*) FILTER (WHERE status = 'running')                          AS running,
-    coalesce(extract(epoch FROM (now() - min(next_run_at) FILTER (
-        WHERE status = 'pending' AND next_run_at <= now()))), 0)        AS oldest_seconds
-FROM task_instances
-WHERE status IN ('pending', 'running')
+    count(*) FILTER (WHERE t.status = 'pending' AND t.next_run_at <= now()) AS claimable,
+    count(*) FILTER (WHERE t.status = 'pending' AND t.next_run_at >  now()) AS scheduled,
+    count(*) FILTER (WHERE t.status = 'running')                            AS running,
+    coalesce(extract(epoch FROM (now() - min(t.next_run_at) FILTER (
+        WHERE t.status = 'pending' AND t.next_run_at <= now()))), 0)        AS oldest_seconds
+FROM task_instances t
+JOIN agents a ON a.id = t.agent_id
+WHERE t.status IN ('pending', 'running')
+  AND a.status = 'running'
 """
 
 

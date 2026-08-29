@@ -36,11 +36,21 @@ SQL = {
     # unsettled one older than a lease is an action whose outcome is unknown --
     # i.e. a duplicate the ledger prevented. Counting them together would hide
     # the number that actually demonstrates 5.3.
+    # Counted by MARKER, not by state alone. reconcile() closes an orphaned
+    # reservation by setting state='done' with the unresolved marker, so
+    # counting `state='done'` would report an action whose effect is unknown as
+    # a successful guard, and counting only `in_flight` would make the
+    # prevented-duplicate evidence vanish the moment it was reconciled --
+    # exactly when it becomes permanent.
     "dupes": """
-        SELECT count(*) FILTER (WHERE state = 'done') AS settled,
+        SELECT count(*) FILTER (
+                   WHERE state = 'done'
+                     AND coalesce(result ->> 'status', '') <> 'unresolved'
+               ) AS settled,
                count(*) FILTER (
-                   WHERE state = 'in_flight'
-                     AND created_at < now() - make_interval(secs => %(ttl)s)
+                   WHERE (state = 'done' AND result ->> 'status' = 'unresolved')
+                      OR (state = 'in_flight'
+                          AND created_at < now() - make_interval(secs => %(ttl)s))
                ) AS prevented
         FROM idempotency
     """,
