@@ -2,14 +2,42 @@
 
 A distributed runtime that makes AI-agent workflows survive failure — and that
 knows the difference between a failure worth retrying and a failure worth
-*paying more* to fix.
+**paying more** to fix.
 
 ```
-An agent is a plan of task IDs:  agent([1, 2, 6, 8, 9])
+An agent is a plan of task IDs:  agent([1, 10, 21, 40, 41])
 Executed in sequence. All state in Postgres. Nothing in worker memory.
 
 Therefore: resumable at exact task granularity, and failure becomes something
 you CLASSIFY rather than blindly retry.
+```
+
+**Status:** 93 tests passing · 23 tasks · 9 tools (5 with real implementations) ·
+6 pipelines · 8 tables
+
+---
+
+## Quickstart
+
+```bash
+docker compose up -d postgres            # schema auto-applies on first boot
+python -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/python -m pytest tests/ -q     # 93 tests
+
+# run it
+python -m chaos.harness workers junior=4 senior=2 --orchestrators 2 &
+python -m chaos.harness seed 20 --pipeline full-incident
+python -m chaos.harness watch            # live dashboard
+```
+
+Then `kill -9` any worker and watch every agent still finish.
+
+Or via the API:
+
+```bash
+uvicorn api.main:app --port 8000
+curl -X POST localhost:8000/agents -H 'content-type: application/json' \
+     -d '{"plan":[1,10,21,40,41],"count":20}'
 ```
 
 ---
@@ -36,7 +64,6 @@ Every failure is classified and routed down exactly one of these.
 | Detected by | lease expiry, no heartbeat | task returned an error |
 | What changes | *who* runs it | ***how*** it runs — bigger model |
 | Extra cost | none, same tier | 12×, senior tier |
-| Share of failures | ~93% | ~7% |
 
 The test is one question: *would running this identically again probably
 succeed?* Yes → recovery. No → escalation.
@@ -50,20 +77,20 @@ Recovery is the substrate. Escalation is the contribution.
 ```
                           ┌──────────────────┐
                           │    Task API      │   stateless, N replicas
-                          │    FastAPI       │   behind a load balancer
+                          │    FastAPI       │
                           └────────┬─────────┘
                                    │ INSERT agents + task_instances
                                    ▼
    ┌────────────────┐    ┌──────────────────────┐    ┌────────────────────┐
    │ Orchestrator 1 │───▶│                      │◀───│  Junior pool × N   │
-   │ Orchestrator 2 │───▶│      POSTGRES        │◀───│  cheap, fails 25%  │
+   │ Orchestrator 2 │───▶│      POSTGRES        │◀───│  cheap tier        │
    │ Orchestrator 3 │───▶│                      │    └────────────────────┘
    └────────────────┘    │  queue + leases      │
      stateless,          │  checkpoints         │    ┌────────────────────┐
      identical loops,    │  idempotency         │◀───│  Senior pool × 2   │
-     no leader election  │  attempt log         │    │  costly, drains    │
-                         └──────────────────────┘    │  escalations only  │
-                            THE ONLY SHARED STATE    └────────────────────┘
+     no leader election  │  attempt log         │    │  escalations only  │
+                         └──────────────────────┘    └────────────────────┘
+                            THE ONLY SHARED STATE
 ```
 
 **No component calls any other component.** Everything talks only to Postgres.
@@ -73,270 +100,275 @@ That single property delivers all three requirements at once:
   and the rest cover. There is no leader to lose.
 - **Scalable** — every process type is horizontally scalable, and the senior
   pool scales independently of the junior pool.
-- **Parallel to build** — each lane's only integration surface is the schema, so
-  the team works simultaneously without coordinating.
+- **Parallel to build** — each lane's only integration surface is the schema.
 
 ### Escalation is task-scoped, never agent-scoped
 
 ```
- agent.plan = [1, 2, 6, 8, 9]
+ agent.plan = [1, 10, 21, 40, 41]
 
- JUNIOR  ──①──▶──②──▶──⑥ fail ──▶──⑥ fail            ──▶──⑧──▶──⑨
-                             │                      ▲
-                      promote │                      │ resume
-                             ▼                      │
- SENIOR                      └────────▶ ⑥ ok ───────┘
-                                        ▲
-                             only THIS task pays 12×
+ JUNIOR  ──①──▶──⑩──▶──㉑ fail ──▶──㉑ fail            ──▶──㊵──▶──㊶
+                              │                       ▲
+                       promote │                       │ resume
+                              ▼                       │
+ SENIOR                       └────────▶ ㉑ ok ───────┘
+                                          ▲
+                               only THIS task pays 12×
 ```
 
 After the promoted task succeeds, its result is written into `agent.context`,
-the cursor advances, and **task 8 claims at `tier='junior'` again.** The agent is
-never permanently upgraded.
+the cursor advances, and **the next task claims at `tier='junior'` again.**
 
-This is the entire cost argument. If promotion ever leaks onto the agent row,
-cost silently converges on the all-senior baseline and the project's central
-claim evaporates. There is an explicit test for it.
+This is the entire cost argument. If promotion ever leaked onto the agent row,
+cost would silently converge on the all-senior baseline. There is an explicit
+test for it (`test_promotion_does_not_leak_to_successor`).
 
 ---
 
-## Fault tolerance
+## Design choices, and why
 
-Kill anything. What happens:
-
-| What dies | Detected by | Recovery | Data lost |
-|---|---|---|---|
-| Worker mid-task | lease expiry (30s) | reaper requeues at same tier; another worker claims | none — resumes at cursor |
-| Senior worker | lease expiry | same, tier preserved | none |
-| Orchestrator | nothing — the other instances already run the identical loop | automatic | none |
-| API replica | load balancer | another replica | none — submission is one transaction |
-| Postgres | everything stalls | HA replica / restart | none committed |
-| Network partition | lease expiry | task double-runs; idempotency key makes the second a no-op | none — exactly-once *effect* |
-
-**The key admission:** you cannot distinguish a crashed worker from a slow one.
-That is a real impossibility result, not a gap in the design. So the runtime
-chooses **at-least-once execution** and defends against the consequence with
-idempotency keys, upgrading it to **exactly-once effect**.
-
-## Scalability
-
-| Dimension | How it scales | Limit |
+| Choice | Why | Cost of the alternative |
 |---|---|---|
-| Workers | add processes; they self-coordinate via `SKIP LOCKED`, zero config | Postgres connections |
-| Orchestrators | add processes; identical loops, `SKIP LOCKED` prevents double-sweep | none practically |
-| API | stateless → horizontal | none |
-| Expensive compute | senior pool scales **independently**; ~7% of tasks reach it | your choice |
+| **Postgres as the only shared state** | Real transactions make exactly-once-effect and ordering guarantees *true*, not merely likely | Redis is faster but you lose the transactional fencing the whole design rests on |
+| **`FOR UPDATE SKIP LOCKED` instead of consensus** | Two workers never claim the same row and never block each other. Coordination lives in the transaction layer | Raft/Zookeeper = a leader to elect, lose and debug |
+| **The scheduler is a SQL query, not a process** | Nothing to scale, nothing to fail over | A scheduler process is a single point of failure |
+| **Orchestrator classifies but never executes** | Keeps it stateless, so N instances are interchangeable | An executing orchestrator becomes a stateful bottleneck |
+| **Worker reports, orchestrator decides** | Separates "what happened" from "what it means" | Routing logic in the worker means every worker carries policy |
+| **Tier ladder in a table, not in code** | Adding a capability tier is one `INSERT` | Hardcoding drifts across three files |
+| **Mock tools by default, live opt-in** | A live third party during a demo is a dependency you don't control | A rate limit on stage looks like your bug |
+| **`difficulty="hard"` fails deterministically** | The escalation demo is reproducible | Probabilistic failure makes the demo a coin flip |
+| **All task rows created up front** | Makes "promotion doesn't leak" *structural*, not a rule to remember | Lazy creation lets tier leak forward silently |
+| **Budgets are accounting only** | Out of scope by decision; the numbers still feed the benchmark | — |
 
-The scheduler is not a process. It is one SQL statement, so there is nothing to
-scale.
+### The two lines doing the heavy lifting
+
+```sql
+AND t.seq = a.cursor          -- can't run task 3 until task 2 is committed
+FOR UPDATE SKIP LOCKED        -- two workers never grab the same task
+```
+
+The first gives dependency ordering for free. The second gives mutual exclusion
+across any number of machines **with no coordinator**. Replacing the first
+predicate with a `deps_satisfied` check is the entire migration path to full DAG
+support.
+
+### The checkpoint has two fences
+
+Reclaim-on-timeout guarantees a slow-but-alive worker and its replacement will
+sometimes both run a task. So both writes are conditional:
+
+| Fence | Prevents |
+|---|---|
+| `AND lease_owner = %(worker_id)s` | a reaped worker committing anyway |
+| `AND cursor = %(seq)s` | a replayed checkpoint double-advancing |
+
+Either matching zero rows → rollback, result discarded.
 
 ---
 
-## The claim query is the entire scheduler
+## Implementation
 
-```sql
-UPDATE task_instances SET
-  status='running', lease_owner=$worker,
-  lease_expires=now()+$ttl, attempt=attempt+1
-WHERE id = (
-  SELECT t.id FROM task_instances t
-  JOIN agents a ON a.id = t.agent_id
-  WHERE t.status='pending'
-    AND t.next_run_at <= now()      -- backoff gate
-    AND t.tier = $pool_tier         -- junior pool ignores escalated work
-    AND a.status = 'running'
-    AND t.seq = a.cursor            -- <- the sequential dependency
-  ORDER BY t.next_run_at
-  FOR UPDATE SKIP LOCKED LIMIT 1    -- <- mutual exclusion, never blocks
-) RETURNING *;
-```
+### Data model — 8 tables
 
-Two lines carry the design:
+| Table | Role |
+|---|---|
+| `agents` | one row per run: `plan INT[]`, `cursor`, `context JSONB`, `cost_units` |
+| `task_instances` | the queue, the lease and the checkpoint in one row |
+| `tiers` | **the escalation ladder, as data** — add a tier with one INSERT |
+| `pipelines` | **named plans** — compose workflows at runtime |
+| `idempotency` | `sha256(agent_id:seq:action)` → exactly-once effect |
+| `attempts` | not a log — **this is the evidence** behind every metric |
+| `dlq` | terminal failures with the full attempt trail |
+| `runtime_config` | chaos + benchmark flags (`force_tier`, tool overrides) |
 
-- **`t.seq = a.cursor`** — no task is claimable until its predecessor commits and
-  advances the cursor. Dependency ordering, free. Swap this predicate for a
-  `deps_satisfied` check and you have full DAG support.
-- **`FOR UPDATE SKIP LOCKED`** — two workers never claim the same row and never
-  wait on each other. This replaces an entire consensus protocol, which is why
-  there is no leader election and no single point of failure.
-
-## The reaper is crash recovery, in full
-
-```sql
-UPDATE task_instances SET
-  status='pending', lease_owner=NULL, failure_class='INFRA',
-  next_run_at = now() + backoff(attempt)
-WHERE status='running' AND lease_expires < now();
-```
-
-Ten lines, running in every orchestrator instance every 2s. It requeues at the
-**same tier** — a dead machine says nothing about model capability.
-
----
-
-## Failure classification
+### Task instance state machine
 
 ```
-                     task 6 fails
-                          │
-                          ▼
-                   ┌─────────────┐
-                   │  CLASSIFY   │
-                   └──┬───┬───┬──┘
-          ┌───────────┘   │   └───────────┐
-          ▼               ▼               ▼
-       INFRA         CAPABILITY        POISON
-          │               │               │
-          ▼               ▼               ▼
-  retry SAME tier   retry same tier   dead-letter queue
-  exponential       up to N, then     no retry, ever
-  backoff           PROMOTE→senior    (nothing fixes it)
-          │               │               │
-  worker died,      model too weak,   malformed input,
-  timeout, 5xx      invalid output    4xx, bad task id
-          │               │               │
-     cost: 0        cost: 12×         cost: 0
+pending  --claim------------------> running     worker takes the lease
+running  --success----------------> succeeded   result committed, cursor++
+running  --raises TaskFailure-----> failed      awaiting orchestrator routing
+running  --lease expired----------> pending     reaper, INFRA, same tier
+failed   --INFRA / retries left---> pending     same tier, backoff
+failed   --CAPABILITY, tier spent-> pending     tier promoted, attempt reset
+failed   --POISON / top tier------> dead        written to dlq
 ```
+
+The worker only ever moves rows into `succeeded` or `failed`. Every routing
+decision belongs to the orchestrator.
+
+### Failure classification
+
+| Class | Trigger | Action | Cost |
+|---|---|---|---|
+| `INFRA` | lease expiry, timeout, 5xx, worker killed | retry **same tier**, exponential backoff, then DLQ after 5 | 0 |
+| `CAPABILITY` | invalid output, agent gave up | retry same tier, then **promote** | real |
+| `POISON` | schema violation, 4xx, unknown task id | **dead-letter immediately** | 0 |
 
 Escalating on `INFRA` would mean a `kill -9` promotes work to the expensive
 model for zero benefit. Escalating on `POISON` burns senior compute on something
-no model can fix. Classification is what makes the cost claim defensible.
+no model can fix. `failure_class` is a deliberately **closed** set — these three
+are exhaustive, and a fourth would have no distinct routing.
+
+### Components
+
+```
+api/main.py           POST /agents · GET /agents/{id} · /metrics · /dlq · /chaos/*
+worker/               claim.py · heartbeat.py · executor.py · main.py
+orchestrator/         reaper.py · classify.py · queue.py · ledger.py · main.py
+common/               protocol · failures · tiers · registry · metrics · runtime · config
+tasks/                registry.py (23 tasks) · tools.py (9 tools)
+chaos/harness.py      seed · pipelines · tools · workers · watch
+```
+
+---
+
+## Extensibility
+
+Everything you'd want to extend is **data or one decorated function** — never a
+code change across multiple files.
+
+**Add a capability tier** — one INSERT. Promotion, cost accounting and pool
+routing all pick it up:
+
+```sql
+INSERT INTO tiers VALUES ('principal', 3, 60, 8000, 4000, 0.99, NULL);
+```
+```bash
+POOL_TIER=principal python -m worker.main    # drains the new queue
+```
+
+`tiers.rank` is `UNIQUE DEFERRABLE` specifically so a tier can be inserted
+*between* two existing ones — shifting ranks collides transiently, which a
+non-deferrable constraint would reject.
+
+**Add a task** — one decorated function in any file under `tasks/`:
+
+```python
+@task(60, name="check-dns", tool="http")
+def check_dns(ctx):
+    return {"resolved": True, "saw": sorted(ctx.prior)}
+```
+
+**Compose a pipeline** — at runtime, no code:
+
+```bash
+python -m chaos.harness pipeline create my-flow 1,13,14,23,31,40,41 "my own line"
+python -m chaos.harness seed 20 --pipeline my-flow
+python -m chaos.harness seed 5  --plan 1,10,21,40      # or inline
+```
+
+**Switch tools between mock and real:**
+
+```bash
+python -m chaos.harness mode live         # everything real
+python -m chaos.harness mode live files   # just one
+python -m chaos.harness tool jira 1.0     # 100% failure injection
+```
+
+5 of the 9 tools do genuine work in live mode: `files` (real repo grep), `shell`
+(allowlisted commands), `metrics_db` (real Postgres query), `http` (real
+network), `github` (real API, public endpoints need no credentials).
+
+---
+
+## What is proven
+
+93 tests against real Postgres. Screenshots are not evidence.
+
+| Invariant | Test |
+|---|---|
+| Unrenewed lease becomes claimable again | `test_expired_lease_becomes_claimable_again` |
+| `SIGKILL` mid-task loses nothing, resumes at its own cursor | `test_sigkill_mid_flight_loses_nothing` |
+| A reaped worker cannot commit a stale result | `test_stale_worker_checkpoint_is_discarded` |
+| `seq=n` never starts before `seq=n-1` commits | `test_task_not_claimable_before_predecessor_commits` |
+| Concurrent workers never claim the same task | `test_concurrent_workers_never_claim_the_same_task` |
+| Forced double execution → exactly one external action | `test_side_effecting_task_runs_once_under_double_execution` |
+| `INFRA` never promotes; `POISON` never reaches senior | `test_infra_retries_at_the_same_tier`, `test_poison_never_reaches_senior` |
+| Promotion does not leak onto the successor | `test_promotion_does_not_leak_to_successor` |
+| Adding a tier needs no code change | `test_adding_a_tier_needs_no_code_change` |
+
+Measured on a live 20-agent run with a `kill -9` mid-flight:
+
+```
+agents completed    20/20
+leases reclaimed        1
+promoted to senior      6   (6.0% of tasks)
+cost                  166 units
+all-senior baseline  1200 units  -> 0.14x
+all-junior baseline   100 units  (6 tasks never finish)
+```
+
+---
+
+## Known issues and limitations
+
+Stated plainly, because a limitation you name is a design decision and one you
+hide is a bug.
+
+**1. Idempotency has a reserve-then-act window.**
+A side-effecting task inserts its key *before* acting. A crash between the
+reserve and the action loses that action — it will not be retried, because the
+key is already present. Closing this properly needs a transactional outbox,
+which is out of scope. The metric we claim (duplicate actions prevented) is
+correct under this design; "no action is ever lost" is not claimed.
+
+**2. Escalation rate is a property of the workload, not a constant.**
+The ~7% figure holds for a mix where roughly 30% of agents contain a hard task.
+Seed only `full-incident` pipelines and it rises past 19%. The rate is an
+*output*, so quote it alongside the workload that produced it.
+
+**3. Fast tasks make crash windows hard to hit.**
+With mock latency, tasks finish in milliseconds and a `kill -9` often lands
+*between* tasks — stranding nothing and reclaiming nothing. This is why
+`tests/test_demo_scenarios.py` uses a plan containing a deliberately slow task.
+**For a live demo, use a long pipeline** or the headline moment may show zero.
+
+**4. `INFRA` retries are capped at 5, globally.**
+A permanently dead tool dead-letters rather than retrying forever. That cap is a
+constant in `orchestrator/classify.py`, not per-tool policy.
+
+**5. Tiers are simulated.**
+There is no LLM in the system. `junior`/`senior` are cost/latency/capability
+stand-ins. The `tiers.model` column exists and is null; wiring real models is one
+INSERT plus one function. **Say "capability tier", not "model", when presenting.**
+
+**6. No multi-tenancy.**
+There is no `tenant_id` anywhere. Per-tenant limits and fair scheduling are not
+implemented and should not be claimed.
+
+**7. No admission control or load shedding.**
+The queue absorbs whatever is submitted. Under extreme spike the pending depth
+grows; nothing returns 503.
+
+**8. Live `shell` is allowlisted, not sandboxed.**
+A task definition is data that a submitted plan can point at, so an open shell
+would let any plan run anything on a worker. Only four commands are permitted.
+
+**9. Connection pooling is not configured for large fleets.**
+Each worker holds a small pool. Beyond roughly 40 processes you would want
+pgbouncer. Not needed at demo scale, and transaction-pooling mode would break
+the `SET CONSTRAINTS ... DEFERRED` the tier ladder uses.
+
+**10. Sequential plans only.**
+`t.seq = a.cursor` enforces a chain. True DAG fan-out is a one-predicate change
+but is not implemented.
 
 ---
 
 ## Repository layout
 
 ```
-Reliable-AI-Agents/
-├── common/
-│   ├── failures.py        C1 · failure taxonomy      (worker ↔ orchestrator)
-│   ├── protocol.py        C2 · TaskDef + TaskContext (registry ↔ executor)
-│   └── config.py          shared env + tier/tool tables
-├── db/
-│   ├── schema.sql         C5 · THE blocking contract
-│   └── pool.py            connection pool
-├── api/                   Lane B · POST /agents, /metrics, /chaos/*
-├── orchestrator/          Lane F · reaper, classify, promote
-│   ├── reaper.py            lease expiry sweep      (recovery path)
-│   ├── classify.py          INFRA | CAPABILITY | POISON
-│   └── promote.py           tier promotion          (escalation path)
-├── worker/                Lane C · claim, heartbeat, execute, checkpoint
-├── tasks/                 Lane A · registry, mock tools, simulated tiers
-├── dash/                  Lane D · dashboard (builds against a JSON fixture)
-├── chaos/                 Lane E · fault-injection harness
-└── tests/                 reliability invariants
-```
-
-## Contracts — freeze these first
-
-Five interfaces. Freeze them and nobody needs to coordinate again; everything
-else is an implementation detail owned by exactly one person.
-
-| | Contract | File | Seam |
-|---|---|---|---|
-| **C1** | Failure taxonomy | `common/failures.py` | worker raises ↔ orchestrator routes |
-| **C2** | TaskDef protocol | `common/protocol.py` | task authors ↔ executor |
-| **C3** | HTTP surface | `api/main.py` | API ↔ chaos harness |
-| **C4** | `/metrics` payload | `dash/fixture.json` | API ↔ dashboard |
-| **C5** | Database schema | `db/schema.sql` | **everyone** |
-
-**Integration rule.** A lane is finished when its contract holds, not when it
-looks right. Lane C and Lane F never read each other's code — they meet only at
-the three strings in C1. If you need to know how another lane works internally,
-a contract is missing: add it here rather than reaching across the boundary.
-
-## Workstreams
-
-```
- T0 ─────────────────────── schema frozen (~45min) ──────────────────────▶
-
- Lane 0  schema · db pool        ████████
- Lane A  tasks · tools · tiers   ████████████████████████        no DB needed
- Lane D  dashboard               ██████████████████████████      mocked metrics
- Lane E  chaos · tests           ████████████████████████████    HTTP contract
- Lane B  task API                        ░░░░░░░░░░░░░░░░░░
- Lane C  worker                          ░░░░░░░░░░░░░░░░░░░░░░
- Lane F  orchestrator                    ░░░░░░░░░░░░░░░░░░░░░░░░
-```
-
-Lanes A, D and E need nothing from anybody and start immediately. Only three of
-seven people ever wait on the schema.
-
-## Build order
-
-| # | Deliverable | Done when |
-|---|---|---|
-| 1 | schema + API + registry + claim loop | 20 agents complete the happy path |
-| 2 | **leases + heartbeat + reaper + resume** | **`kill -9` a worker → 20/20 ✓ — stop and verify here** |
-| 3 | classifier + backoff + DLQ | forced tool failure classifies correctly |
-| 4 | **tier promotion + senior pool** | hard task → senior → agent resumes on junior |
-| 5 | idempotency keys | duplicate actions = 0 |
-| 6 | dashboard + three-way benchmark | the cost comparison runs live |
-| 7 | *stretch* multi-orchestrator | kill one, nothing changes |
-| 8 | *stretch* real models · DAG plans | Haiku junior, Opus senior |
-
-Phase 2 de-risks everything. A working crash-recovery demo early beats a
-half-finished everything late.
-
----
-
-## What we have to prove
-
-| Strategy | Completion | Cost units | Reading |
-|---|---|---|---|
-| all junior | low | 1× | cheap, unreliable |
-| all senior | high | ~12× | reliable, wasteful |
-| **tiered (ours)** | **= all senior** | **~2×** | only ~7% escalated |
-
-### Invariants — automated fault injection, not screenshots
-
-1. A task whose lease stops being renewed becomes claimable again.
-2. `SIGKILL` a worker mid-task → no agent lost, each resumed at its own cursor.
-3. Forced double execution of a side-effecting task → exactly one external action.
-4. `seq=n` never starts before `seq=n-1` commits, asserted from `attempts` timestamps.
-5. `INFRA` never promotes; `CAPABILITY` promotes only after same-tier attempts are exhausted; `POISON` never reaches senior.
-6. A promoted task's successor claims at `tier='junior'` — promotion does not leak onto the agent.
-7. An escalated task receives the full accumulated context from every prior task.
-
-### Demo sequence
-
-1. Submit 20 agents, plan `[1,2,6,8,9]`.
-2. `docker kill worker-2` mid-flight.
-3. Reaper fires at T+30s → each resumes at **its own** cursor.
-   → *4 tasks re-executed, 47 avoided.*
-4. Hard task fails twice on junior → promotes → senior succeeds → back to junior.
-5. Three-way cost table, live via `/chaos/config`.
-6. `jira` failure rate to 1.0 → retries, backoff, dead-letter queue.
-7. `docker kill orchestrator-1` → nothing changes.
-
----
-
-## Getting started
-
-```bash
-docker compose up -d postgres
-psql "$DATABASE_URL" -f db/schema.sql
-
-pip install -r requirements.txt
-
-uvicorn api.main:app --reload          # Task API
-python -m orchestrator.main            # reaper + classifier
-POOL_TIER=junior python -m worker.main # junior worker
-POOL_TIER=senior python -m worker.main # senior worker
+api/          Task API (FastAPI)
+common/       contracts: protocol, failures, tiers, registry, metrics, runtime
+db/           schema.sql — the load-bearing contract — and the connection pool
+worker/       claim → heartbeat → execute → checkpoint
+orchestrator/ reaper (recovery) · classify (routing) · queue · ledger
+tasks/        registry.py (23 tasks) · tools.py (9 tools, 5 with live impls)
+chaos/        harness.py (CLI) · demo.sh · verify.sh
+tests/        93 tests
 ```
 
 ---
-
-## Design notes
-
-- **Postgres over Redis, deliberately.** Real transactions are what make
-  exactly-once-effect and ordering guarantees true rather than merely likely.
-- **Mock tools over real APIs, deliberately.** The demo must be fast,
-  reproducible and independent of network conditions on stage.
-- **Budgets are accounting only.** `cost_units` and `tokens_used` accumulate so
-  the benchmark has real numbers; nothing terminates an agent for exceeding them.
-- **Keep the agent thin.** The infrastructure is the product. The agent is a
-  workload generator that happens to fail in interesting ways.
 
 > The agent did not become smarter. The system learned which failures were worth
 > paying to fix.
